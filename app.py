@@ -1,4 +1,4 @@
-import json, os, re, threading, time, unicodedata
+import json, os, re, threading, time
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
@@ -168,10 +168,9 @@ HELP = (
     "指令：\n"
     "派單 訂單內容 → 轉發到司機群組\n"
     "回 司機名 內容 → 回覆群組並標註該司機\n"
-    "取消 訂單關鍵字 → 取消訂單、停止重送\n"
+    "取消 → 取消全部進行中的訂單，並停止重送\n"
     "列表 → 看進行中的訂單\n"
-    "狀態 → 檢查綁定與自動重送是否正常\n"
-    "（只有一張進行中的單時，關鍵字可省略；有多筆符合會請你回覆 1、1,3 或「全部」選擇）"
+    "狀態 → 檢查綁定與自動重送是否正常"
 )
 
 def parse_driver(rest):
@@ -186,39 +185,21 @@ def parse_driver(rest):
 def driver_target(name):
     return {"user_id": S["drivers"].get(name), "name": name}
 
-def norm(x):
-    """比對用：全形轉半形、去掉所有空白與換行、轉小寫（避免空格差異造成比對失敗）。"""
-    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", x)).lower()
-
 def one_line(content, n=60):
     t = re.sub(r"\s+", " ", content).strip()
     return t if len(t) <= n else t[:n - 16] + "…" + t[-15:]  # 保留結尾，因為相同開頭的單常常差在後面
 
-def open_orders(keyword=""):
-    items = list(S["orders"].items())
-    kw = norm(keyword)
-    if kw:
-        items = [(k, v) for k, v in items if kw in norm(v["content"])]
-    return items
+def open_orders():
+    return list(S["orders"].items())
 
-# 多筆符合時，暫存管理員的選擇（只存在記憶體，不需要編號）
-PENDING = {}
-
-def ask_choose(items):
-    PENDING.clear()
-    PENDING.update(ids=[k for k, _ in items])
-    rows = "\n".join(f"{i}. {one_line(v['content'])}" for i, (_, v) in enumerate(items, 1))
-    return (f"有 {len(items)} 筆符合，請回覆要處理哪幾筆：\n{rows}\n\n"
-            "回覆「1」、「1,3」或「全部」（回其他內容＝取消這次選擇）")
-
-def do_cancel(ids):
-    chosen = [S["orders"].pop(i) for i in ids if i in S["orders"]]
-    if not chosen:
-        return "這些訂單已經不存在"
+def cancel_all():
+    """取消全部進行中的訂單 = 停止重送。群組不公告（只回覆管理員）。"""
+    n = len(S["orders"])
+    if not n:
+        return "目前沒有進行中的訂單"
+    S["orders"].clear()
     save()
-    body = "\n──────\n".join(o["content"] for o in chosen)
-    push(S["group"], f"❌ 訂單已取消\n{body}")
-    return f"✅ 已取消 {len(chosen)} 筆，停止重送"
+    return f"✅ 已取消 {n} 筆，停止重送"
 
 def on_private(event, text, src):
     # 綁定管理員
@@ -238,20 +219,6 @@ def on_private(event, text, src):
         return reply(event.reply_token, "此機器人僅限管理員使用")
     if not S["group"]:
         return reply(event.reply_token, "尚未綁定群組：請把我拉進司機群組，並在群組輸入「綁定群組」")
-
-    # 上一則是「有多筆符合」的選擇題：回數字或「全部」就執行，其他內容視為放棄
-    if PENDING:
-        sel = text.strip()
-        if re.fullmatch(r"全部|\d+(?:[\s,，、]+\d+)*", sel):
-            ids = PENDING["ids"]
-            if sel != "全部":
-                picks = {int(n) for n in re.findall(r"\d+", sel)}
-                if any(n < 1 or n > len(ids) for n in picks):
-                    return reply(event.reply_token, f"請回覆 1 到 {len(ids)} 之間的數字，或「全部」")
-                ids = [ids[n - 1] for n in sorted(picks)]
-            PENDING.clear()
-            return reply(event.reply_token, do_cancel(ids))
-        PENDING.clear()
 
     if text.startswith("派單"):
         body = text[2:].strip()
@@ -275,12 +242,10 @@ def on_private(event, text, src):
         return reply(event.reply_token, f"✅ 已回覆並標註：{name}{note}")
 
     if text.startswith("取消"):
-        items = open_orders(text[2:])
-        if not items:
-            return reply(event.reply_token, "找不到符合的訂單（可用「列表」查看）")
-        if len(items) > 1:
-            return reply(event.reply_token, ask_choose(items))
-        return reply(event.reply_token, do_cancel([items[0][0]]))
+        if text.strip() != "取消":
+            return reply(event.reply_token,
+                         "取消不需要關鍵字：直接輸入「取消」，會取消全部進行中的訂單並停止重送")
+        return reply(event.reply_token, cancel_all())
 
     if text == "狀態":
         alive = "運作中" if RESENDER.is_alive() else "已停止"
