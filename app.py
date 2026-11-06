@@ -85,6 +85,7 @@ def member_name(group_id, user_id):
 # ---------- Webhook ----------
 @app.post("/callback")
 def callback():
+    ensure_resender()
     try:
         handler.handle(request.get_data(as_text=True),
                        request.headers.get("X-Line-Signature", ""))
@@ -315,7 +316,7 @@ def on_private(event, text, src):
                      f"群組綁定：{'是' if S['group'] else '否'}\n"
                      f"未指派訂單：{len(open_orders())} 筆\n"
                      f"重送間隔：{RESEND_INTERVAL} 秒\n"
-                     f"重送執行緒：{alive}\n"
+                     f"重送執行緒：{alive}（啟動 {STATS.get('thread_starts', 0)} 次）\n"
                      f"服務已運行：{int((time.time() - STATS['started']) // 60)} 分鐘\n"
                      f"重送成功：{STATS['ok']} 次，失敗：{STATS['err']} 次\n"
                      f"最近成功：{tw(STATS['last_ok'])}\n"
@@ -375,12 +376,26 @@ def resender():
         except Exception as e:  # 任何錯誤都不能讓重送執行緒結束
             print("resender error:", e, flush=True)
 
-RESENDER = threading.Thread(target=resender, daemon=True)
-RESENDER.start()
+RESENDER = None
+_resender_lock = threading.Lock()
+
+def ensure_resender():
+    """確保「這個 worker 行程」裡有一條活著的重送執行緒。
+    gunicorn 若先在主程序載入程式再 fork worker，fork 出來的 worker 不會帶著原本的執行緒
+    （狀態會顯示已停止），所以每次收到請求時都檢查，沒活著就重新啟動。"""
+    global RESENDER
+    with _resender_lock:
+        if RESENDER is None or not RESENDER.is_alive():
+            RESENDER = threading.Thread(target=resender, daemon=True)
+            RESENDER.start()
+            STATS["thread_starts"] = STATS.get("thread_starts", 0) + 1
+
+# 不在載入時啟動：只在「真正處理請求的 worker」裡，於第一個請求時啟動（見 callback / health）
 
 @app.get("/")
 def health():
     """給 UptimeRobot 等服務定時呼叫，避免免費版閒置休眠（休眠時不會重送）。"""
+    ensure_resender()
     return "ok"
 
 if __name__ == "__main__":
