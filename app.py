@@ -230,14 +230,23 @@ def on_private(event, text, src):
                                  "last_sent": time.time(), "resend_count": 0}
         save()
         print(f"dispatch: order={order_id}", flush=True)
-        push(S["group"], f"📦 新訂單\n{body}\n\n要接請標註我並回：內容 時間")
+        try:
+            push(S["group"], f"📦 新訂單\n{body}\n\n要接請標註我並回：內容 時間")
+        except Exception as e:
+            S["orders"].pop(order_id, None)
+            save()
+            return reply(event.reply_token,
+                         f"⚠️ 發送到群組失敗，這張單沒有建立：\n{err_text(e)}")
         return reply(event.reply_token, "✅ 已發送")
 
     if text.startswith("回"):
         name, msg = parse_driver(text[1:])
         if not name or not msg:
             return reply(event.reply_token, "格式：回 司機名 內容")
-        push_tagged(S["group"], f"💬 {msg}", [driver_target(name)])
+        try:
+            push_tagged(S["group"], f"💬 {msg}", [driver_target(name)])
+        except Exception as e:
+            return reply(event.reply_token, f"⚠️ 發送到群組失敗：\n{err_text(e)}")
         note = "" if S["drivers"].get(name) else "\n（此司機還沒喊過單，無法真標註，群組只顯示 @名字）"
         return reply(event.reply_token, f"✅ 已回覆並標註：{name}{note}")
 
@@ -271,6 +280,14 @@ def on_private(event, text, src):
 _warned_unbound = False
 STATS = {"started": time.time(), "ok": 0, "err": 0, "last_ok": None, "last_err": None}
 
+def err_text(e):
+    """把 LINE SDK 的例外整理成短短一行：HTTP 狀態碼 + LINE 回的訊息。"""
+    status = getattr(e, "status", None)
+    if status:
+        detail = getattr(e, "body", None) or getattr(e, "reason", "") or ""
+        return f"HTTP {status} {detail}".strip()[:200]
+    return str(e)[:200]
+
 def tw(ts):
     """台灣時間 月/日 時:分:秒"""
     if not ts:
@@ -301,8 +318,8 @@ def resend_due():
                 print(f"resend ok: order={order_id} n={o['resend_count']}", flush=True)
             except Exception as e:
                 STATS["err"] += 1
-                STATS["last_err"] = f"{tw(time.time())} {e}"[:300]
-                print(f"resend failed: order={order_id} error={e}", flush=True)
+                STATS["last_err"] = f"{tw(time.time())} {err_text(e)}"
+                print(f"resend failed: order={order_id} error={err_text(e)}", flush=True)
 
 def resender():
     print(f"resender started (interval={RESEND_INTERVAL}s)", flush=True)
