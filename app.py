@@ -1,4 +1,4 @@
-import json, os, re, threading, time
+import json, os, re, time
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
@@ -14,7 +14,7 @@ CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 CHANNEL_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "change-me")  # 綁定管理員用
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
-RESEND_INTERVAL = int(os.environ.get("RESEND_INTERVAL", "30"))  # 秒
+RESEND_INTERVAL = int(os.environ.get("RESEND_INTERVAL", "30"))  # 被動刷單的最短間隔（秒）
 
 app = Flask(__name__)
 handler = WebhookHandler(CHANNEL_SECRET)
@@ -40,7 +40,23 @@ if not S.get("group") and os.environ.get("GROUP_ID"):
     S["group"] = os.environ["GROUP_ID"]
 print(f"startup: admin_bound={bool(S.get('admin'))} group_bound={bool(S.get('group'))}", flush=True)
 
+STATS = {"started": time.time(), "passive": 0, "last_err": None}
+LAST_PASSIVE = 0.0
+
+def now_tw():
+    """台灣時間 月/日 時:分:秒"""
+    return datetime.now(timezone(timedelta(hours=8))).strftime("%m/%d %H:%M:%S")
+
+def err_text(e):
+    """把 LINE SDK 的例外整理成短短一行：HTTP 狀態碼 + LINE 回的訊息。"""
+    status = getattr(e, "status", None)
+    if status:
+        detail = getattr(e, "body", None) or getattr(e, "reason", "") or ""
+        return f"HTTP {status} {detail}".strip()[:200]
+    return str(e)[:200]
+
 # ---------- LINE 工具 ----------
+# 原則：群組裡的訊息一律用 Reply API（不計費）。只有「喊單通知管理員私訊」會用 push（1 則）。
 def push(to, text):
     with ApiClient(config) as c:
         MessagingApi(c).push_message(
@@ -51,12 +67,11 @@ def reply(token, text):
         MessagingApi(c).reply_message(
             ReplyMessageRequest(reply_token=token, messages=[TextMessage(text=text)]))
 
-def push_tagged(to, body, targets):
-    """在群組發訊息，並自動標註（@）司機。targets: [{"user_id":..., "name":...}]
-    沒有 user_id 的司機無法真標註，改用純文字 @名字。
-    標註失敗時退回純文字，確保訊息一定送得出去。"""
+def reply_tagged(token, body, targets):
+    """用 Reply API 回覆，並自動標註（@）targets: [{"user_id":..., "name":...}]。
+    沒有 user_id 的人無法真標註，改用純文字 @名字；標註失敗時退回純文字。"""
     if not targets:
-        return push(to, body)
+        return reply(token, body)
     try:
         subs, parts = {}, []
         for i, t in enumerate(targets[:20]):  # LINE 單則最多標註 20 人
@@ -69,11 +84,12 @@ def push_tagged(to, body, targets):
                 parts.append("@" + t["name"])
         text = " ".join(parts) + "\n" + body
         with ApiClient(config) as c:
-            MessagingApi(c).push_message(PushMessageRequest(
-                to=to, messages=[TextMessageV2(text=text, substitution=subs or None)]))
+            MessagingApi(c).reply_message(ReplyMessageRequest(
+                reply_token=token,
+                messages=[TextMessageV2(text=text, substitution=subs or None)]))
     except Exception as e:
-        print("tag failed, fallback to plain text:", e)
-        push(to, " ".join("@" + t["name"] for t in targets) + "\n" + body)
+        print("tag failed, fallback to plain text:", err_text(e), flush=True)
+        reply(token, " ".join("@" + t["name"] for t in targets) + "\n" + body)
 
 def member_name(group_id, user_id):
     try:
@@ -85,7 +101,6 @@ def member_name(group_id, user_id):
 # ---------- Webhook ----------
 @app.post("/callback")
 def callback():
-    ensure_resender()
     try:
         handler.handle(request.get_data(as_text=True),
                        request.headers.get("X-Line-Signature", ""))
@@ -93,14 +108,23 @@ def callback():
         abort(400)
     return "OK"
 
+@app.get("/")
+def health():
+    """給 UptimeRobot 等服務定時呼叫，避免免費版閒置休眠。"""
+    return "ok"
+
 @handler.add(MessageEvent, message=TextMessageContent)
 def on_message(event):
     text = event.message.text.strip()
     src = event.source
-    if isinstance(src, GroupSource):
-        on_group(event, text, src)
-    elif isinstance(src, UserSource):
-        on_private(event, text, src)
+    try:
+        if isinstance(src, GroupSource):
+            on_group(event, text, src)
+        elif isinstance(src, UserSource):
+            on_private(event, text, src)
+    except Exception as e:  # 單一訊息出錯不要讓 webhook 回 500
+        STATS["last_err"] = f"{now_tw()} {err_text(e)}"
+        print("handler error:", err_text(e), flush=True)
 
 # ---------- 標註偵測 ----------
 def strip_self_mention(message):
@@ -124,55 +148,24 @@ def strip_self_mention(message):
     return True, out.decode("utf-16-le").strip()
 
 DRIVER_HINT = "請標註我並寫上內容和時間，例如：@機器人 桃園機場 18:30"
-
-# ---------- 司機群組 ----------
-def on_group(event, text, src):
-    if text == "綁定群組":
-        if src.user_id != S["admin"]:
-            return reply(event.reply_token, "只有管理員可以綁定群組")
-        S["group"] = src.group_id
-        save()
-        push(S["admin"],
-             f"群組 ID：{src.group_id}\n"
-             "建議到 Render 的 Environment 新增變數 GROUP_ID（值填上面這串），"
-             "之後服務重啟或休眠後不用重新綁定。")
-        return reply(event.reply_token, "✅ 已綁定為派單群組")
-
-    if src.group_id != S["group"]:
-        return
-
-    # 喊單方式一：標註機器人 + 內容 時間，例如「@機器人 桃園機場 18:30」
-    # 喊單方式二（舊）：「喊 桃園機場 18:30」
-    mentioned, rest = strip_self_mention(event.message)
-    if mentioned:
-        content = rest
-        if not content:
-            return reply(event.reply_token, DRIVER_HINT)
-    else:
-        m = re.fullmatch(r"(?:喊單?|\+1)\s+(.+)", text, re.S)
-        if not m:
-            return
-        content = m.group(1).strip()
-
-    name = member_name(src.group_id, src.user_id)
-    S["drivers"][name] = src.user_id  # 記住名字對應的 user_id，之後回覆才能標註
-    save()
-    # 喊單成功不在群組顯示，只私訊通知管理員
-    if S["admin"]:
-        push(S["admin"],
-             f"🙋 {name} 喊單\n{content}\n\n"
-             f"回覆司機：回 {name} 內容")
-
-# ---------- 管理員私訊 ----------
-HELP = (
-    "指令：\n"
-    "派單 訂單內容 → 轉發到司機群組\n"
-    "回 司機名 內容 → 回覆群組並標註該司機\n"
-    "取消 → 取消全部進行中的訂單，並停止重送\n"
+GROUP_HELP = (
+    "管理員指令（標註我再輸入）：\n"
+    "@機器人 派單 訂單內容\n"
+    "@機器人 回 司機名 內容\n"
+    "@機器人 取消\n"
+    "@機器人 列表"
+)
+PRIVATE_HELP = (
+    "私訊指令：\n"
+    "取消 → 取消全部進行中的訂單，停止刷單\n"
     "列表 → 看進行中的訂單\n"
-    "狀態 → 檢查綁定與自動重送是否正常"
+    "狀態 → 檢查綁定與運作狀況\n\n"
+    "派單、回覆司機請到司機群組，標註我再輸入：\n"
+    "@機器人 派單 訂單內容\n"
+    "@機器人 回 司機名 內容"
 )
 
+# ---------- 工具：司機名、訂單 ----------
 def parse_driver(rest):
     """從「司機名 其餘內容」切出司機名。優先比對已知司機名（支援名字內有空格）。"""
     rest = rest.strip()
@@ -189,168 +182,154 @@ def one_line(content, n=60):
     t = re.sub(r"\s+", " ", content).strip()
     return t if len(t) <= n else t[:n - 16] + "…" + t[-15:]  # 保留結尾，因為相同開頭的單常常差在後面
 
-def open_orders():
-    return list(S["orders"].items())
+def list_text():
+    rows = [f"・{one_line(o['content'])}" for o in S["orders"].values()]
+    return "\n".join(rows) or "沒有進行中的訂單"
 
 def cancel_all():
-    """取消全部進行中的訂單 = 停止重送。群組不公告（只回覆管理員）。"""
+    """取消全部進行中的訂單 = 停止被動刷單。"""
     n = len(S["orders"])
     if not n:
         return "目前沒有進行中的訂單"
     S["orders"].clear()
     save()
-    return f"✅ 已取消 {n} 筆，停止重送"
+    return f"✅ 已取消 {n} 筆，停止刷單"
 
+# ---------- 被動刷單（Reply API，免費） ----------
+def passive_remind(event):
+    """群組裡有人發言（不是喊單、不是管理員指令）時，用 Reply API 免費回覆目前進行中的訂單。
+    全域節流：每 RESEND_INTERVAL 秒最多一次，避免洗版。"""
+    global LAST_PASSIVE
+    if not S["orders"]:
+        return
+    now = time.time()
+    if now - LAST_PASSIVE < RESEND_INTERVAL:
+        return
+    body = "\n──────\n".join(o["content"] for o in S["orders"].values())[:4500]
+    try:
+        reply(event.reply_token, f"🔁 自動刷單\n{body}\n\n要接請標註我並回：內容 時間")
+    except Exception as e:
+        print("passive remind failed:", err_text(e), flush=True)
+        return
+    LAST_PASSIVE = now
+    STATS["passive"] += 1
+
+# ---------- 司機群組 ----------
+def on_group(event, text, src):
+    if text == "綁定群組":
+        if src.user_id != S["admin"]:
+            return reply(event.reply_token, "只有管理員可以綁定群組")
+        S["group"] = src.group_id
+        save()
+        return reply(event.reply_token, "✅ 已綁定為派單群組")
+
+    if src.group_id != S["group"]:
+        return
+
+    mentioned, rest = strip_self_mention(event.message)
+
+    # 管理員標註機器人 → 當成指令（派單 / 回 / 取消 / 列表）
+    if mentioned and src.user_id == S["admin"]:
+        return admin_group_command(event, rest)
+
+    # 喊單方式一：標註機器人 + 內容 時間，例如「@機器人 桃園機場 18:30」
+    # 喊單方式二（舊）：「喊 桃園機場 18:30」
+    if mentioned:
+        content = rest
+        if not content:
+            return reply(event.reply_token, DRIVER_HINT)
+    else:
+        m = re.fullmatch(r"(?:喊單?|\+1)\s+(.+)", text, re.S)
+        if not m:
+            return passive_remind(event)  # 一般發言：免費被動刷單
+        content = m.group(1).strip()
+
+    name = member_name(src.group_id, src.user_id)
+    S["drivers"][name] = src.user_id  # 記住名字對應的 user_id，之後回覆才能標註
+    save()
+    notify_admin_of_shout(event, name, content)
+
+def notify_admin_of_shout(event, name, content):
+    """喊單成功：預設私訊通知管理員（push，1 則）。
+    若私訊推播失敗（例如額度用完），改用免費的 Reply 在群組標註管理員，避免漏接。"""
+    if not S["admin"]:
+        return
+    try:
+        push(S["admin"],
+             f"🙋 {name} 喊單\n{content}\n\n"
+             f"回覆司機：到群組輸入「@機器人 回 {name} 內容」")
+        return
+    except Exception as e:
+        STATS["last_err"] = f"{now_tw()} {err_text(e)}"
+        print("notify admin by push failed:", err_text(e), flush=True)
+    reply_tagged(event.reply_token, f"🙋 {name} 喊單\n{content}",
+                 [{"user_id": S["admin"], "name": "管理員"}])
+
+def admin_group_command(event, cmd):
+    """管理員在群組標註機器人後輸入的指令。全部用 Reply API，不扣額度。"""
+    global LAST_PASSIVE
+    tok = event.reply_token
+    if cmd.startswith("派單"):
+        body = cmd[2:].strip()
+        if not body:
+            return reply(tok, "請在「派單」後面接訂單內容")
+        order_id = str(S["next_id"])  # 內部使用，不顯示
+        S["next_id"] += 1
+        S["orders"][order_id] = {"content": body}
+        save()
+        LAST_PASSIVE = time.time()  # 剛發過，避免馬上又被動刷一次
+        return reply(tok, f"📦 新訂單\n{body}\n\n要接請標註我並回：內容 時間")
+    if cmd == "取消":
+        return reply(tok, cancel_all())
+    if cmd.startswith("取消"):
+        return reply(tok, "取消不需要關鍵字：@機器人 取消")
+    if cmd.startswith("回"):
+        name, msg = parse_driver(cmd[1:])
+        if not name or not msg:
+            return reply(tok, "格式：@機器人 回 司機名 內容")
+        return reply_tagged(tok, f"💬 {msg}", [driver_target(name)])
+    if cmd == "列表":
+        return reply(tok, list_text())
+    if cmd == "狀態":
+        return reply(tok, "狀態請私訊機器人輸入「狀態」")
+    return reply(tok, GROUP_HELP)
+
+# ---------- 管理員私訊 ----------
 def on_private(event, text, src):
+    tok = event.reply_token
     # 綁定管理員
     if text.startswith("我是管理員"):
         if text.replace("我是管理員", "").strip() == ADMIN_PASSWORD:
             S["admin"] = src.user_id
             save()
-            return reply(event.reply_token,
-                         "✅ 已綁定為管理員\n"
-                         f"你的 ID：{src.user_id}\n"
-                         "建議到 Render 的 Environment 新增變數 ADMIN_USER_ID（值填上面這串），"
-                         "之後服務重啟或休眠後不用重新綁定。\n\n"
-                         "把我拉進司機群組後，在群組輸入「綁定群組」\n\n" + HELP)
-        return reply(event.reply_token, "密碼錯誤")
+            return reply(tok, "✅ 已綁定為管理員\n把我拉進司機群組後，在群組輸入「綁定群組」\n\n" + PRIVATE_HELP)
+        return reply(tok, "密碼錯誤")
 
     if src.user_id != S["admin"]:
-        return reply(event.reply_token, "此機器人僅限管理員使用")
-    if not S["group"]:
-        return reply(event.reply_token, "尚未綁定群組：請把我拉進司機群組，並在群組輸入「綁定群組」")
+        return reply(tok, "此機器人僅限管理員使用")
 
-    if text.startswith("派單"):
-        body = text[2:].strip()
-        if not body:
-            return reply(event.reply_token, "請在「派單」後面接訂單內容")
-        order_id = str(S["next_id"])  # 內部使用，不顯示給司機
-        S["next_id"] += 1
-        S["orders"][order_id] = {"content": body,
-                                 "last_sent": time.time(), "resend_count": 0}
-        save()
-        print(f"dispatch: order={order_id}", flush=True)
-        try:
-            push(S["group"], f"📦 新訂單\n{body}\n\n要接請標註我並回：內容 時間")
-        except Exception as e:
-            S["orders"].pop(order_id, None)
-            save()
-            return reply(event.reply_token,
-                         f"⚠️ 發送到群組失敗，這張單沒有建立：\n{err_text(e)}")
-        return reply(event.reply_token, "✅ 已發送")
-
-    if text.startswith("回"):
-        name, msg = parse_driver(text[1:])
-        if not name or not msg:
-            return reply(event.reply_token, "格式：回 司機名 內容")
-        try:
-            push_tagged(S["group"], f"💬 {msg}", [driver_target(name)])
-        except Exception as e:
-            return reply(event.reply_token, f"⚠️ 發送到群組失敗：\n{err_text(e)}")
-        note = "" if S["drivers"].get(name) else "\n（此司機還沒喊過單，無法真標註，群組只顯示 @名字）"
-        return reply(event.reply_token, f"✅ 已回覆並標註：{name}{note}")
-
+    if text.startswith("派單") or text.startswith("回"):
+        return reply(tok, "派單、回覆司機請到司機群組，標註我再輸入：\n"
+                          "@機器人 派單 訂單內容\n@機器人 回 司機名 內容\n"
+                          "（用免費的回覆方式發送，不扣 LINE 額度）")
+    if text == "取消":
+        return reply(tok, cancel_all())
     if text.startswith("取消"):
-        if text.strip() != "取消":
-            return reply(event.reply_token,
-                         "取消不需要關鍵字：直接輸入「取消」，會取消全部進行中的訂單並停止重送")
-        return reply(event.reply_token, cancel_all())
-
+        return reply(tok, "取消不需要關鍵字：直接輸入「取消」")
+    if text == "列表":
+        return reply(tok, list_text())
     if text == "狀態":
-        alive = "運作中" if RESENDER.is_alive() else "已停止"
-        return reply(event.reply_token,
+        return reply(tok,
                      "📊 狀態\n"
                      f"管理員綁定：{'是' if S['admin'] else '否'}\n"
                      f"群組綁定：{'是' if S['group'] else '否'}\n"
-                     f"進行中訂單：{len(open_orders())} 筆\n"
-                     f"重送間隔：{RESEND_INTERVAL} 秒\n"
-                     f"重送執行緒：{alive}（啟動 {STATS.get('thread_starts', 0)} 次）\n"
+                     f"進行中訂單：{len(S['orders'])} 筆\n"
+                     f"被動刷單間隔：{RESEND_INTERVAL} 秒（免費，群組有人發言時才會刷）\n"
+                     f"被動刷單次數：{STATS['passive']} 次\n"
                      f"服務已運行：{int((time.time() - STATS['started']) // 60)} 分鐘\n"
-                     f"重送成功：{STATS['ok']} 次，失敗：{STATS['err']} 次\n"
-                     f"最近成功：{tw(STATS['last_ok'])}\n"
-                     f"最近錯誤：{STATS['last_err'] or '無'}")
-
-    if text == "列表":
-        rows = [f"・{one_line(v['content'])}" for _, v in open_orders()]
-        return reply(event.reply_token, "\n".join(rows) or "沒有進行中的訂單")
-
-    reply(event.reply_token, HELP)
-
-# ---------- 自動重送 ----------
-_warned_unbound = False
-STATS = {"started": time.time(), "ok": 0, "err": 0, "last_ok": None, "last_err": None}
-
-def err_text(e):
-    """把 LINE SDK 的例外整理成短短一行：HTTP 狀態碼 + LINE 回的訊息。"""
-    status = getattr(e, "status", None)
-    if status:
-        detail = getattr(e, "body", None) or getattr(e, "reason", "") or ""
-        return f"HTTP {status} {detail}".strip()[:200]
-    return str(e)[:200]
-
-def tw(ts):
-    """台灣時間 月/日 時:分:秒"""
-    if not ts:
-        return "無"
-    return datetime.fromtimestamp(ts, timezone(timedelta(hours=8))).strftime("%m/%d %H:%M:%S")
-
-def resend_due():
-    """進行中（未取消）的訂單，距離上次發送滿 RESEND_INTERVAL 秒就重送到群組。
-    取消（pop）後就不再重送。"""
-    global _warned_unbound
-    if not S["group"]:
-        if S["orders"] and not _warned_unbound:
-            print("resend skipped: group not bound", flush=True)
-            _warned_unbound = True
-        return
-    _warned_unbound = False
-    now = time.time()
-    for order_id, o in list(S["orders"].items()):
-        if now - o.get("last_sent", 0) >= RESEND_INTERVAL:  # 舊資料沒有 last_sent 也會重送
-            o["last_sent"] = now
-            o["resend_count"] = o.get("resend_count", 0) + 1
-            try:
-                push(S["group"],
-                     f"🔁 自動刷單\n"
-                     f"{o['content']}\n\n要接請標註我並回：內容 時間")
-                STATS["ok"] += 1
-                STATS["last_ok"] = time.time()
-                print(f"resend ok: order={order_id} n={o['resend_count']}", flush=True)
-            except Exception as e:
-                STATS["err"] += 1
-                STATS["last_err"] = f"{tw(time.time())} {err_text(e)}"
-                print(f"resend failed: order={order_id} error={err_text(e)}", flush=True)
-
-def resender():
-    print(f"resender started (interval={RESEND_INTERVAL}s)", flush=True)
-    while True:
-        time.sleep(1)
-        try:
-            resend_due()
-        except Exception as e:  # 任何錯誤都不能讓重送執行緒結束
-            print("resender error:", e, flush=True)
-
-RESENDER = None
-_resender_lock = threading.Lock()
-
-def ensure_resender():
-    """確保「這個 worker 行程」裡有一條活著的重送執行緒。
-    gunicorn 若先在主程序載入程式再 fork worker，fork 出來的 worker 不會帶著原本的執行緒
-    （狀態會顯示已停止），所以每次收到請求時都檢查，沒活著就重新啟動。"""
-    global RESENDER
-    with _resender_lock:
-        if RESENDER is None or not RESENDER.is_alive():
-            RESENDER = threading.Thread(target=resender, daemon=True)
-            RESENDER.start()
-            STATS["thread_starts"] = STATS.get("thread_starts", 0) + 1
-
-# 不在載入時啟動：只在「真正處理請求的 worker」裡，於第一個請求時啟動（見 callback / health）
-
-@app.get("/")
-def health():
-    """給 UptimeRobot 等服務定時呼叫，避免免費版閒置休眠（休眠時不會重送）。"""
-    ensure_resender()
-    return "ok"
+                     f"最近錯誤：{STATS['last_err'] or '無'}\n\n"
+                     f"（設定用，可忽略）\n管理員 ID：{S['admin']}\n群組 ID：{S['group']}")
+    reply(tok, PRIVATE_HELP)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
