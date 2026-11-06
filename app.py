@@ -334,10 +334,9 @@ def record_shout(event, group_id, user_id, content):
         "updated_at": now_tw()
     }
     save()
-    return driver_group_reply(
-        event,
-        f"✅ 喊單已記錄\n{name}：{content}\n\n派單員可在派單員群組輸入「喊單列表」查看。"
-    )
+    # 司機喊單只寫入資料，不在司機群組回覆「喊單已記錄」，避免洗版。
+    # 派單員仍可在派單員群組輸入「喊單列表」查看。
+    return
 
 
 # ---------------- Webhook ----------------
