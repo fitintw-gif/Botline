@@ -325,22 +325,76 @@ def clear_all_pending_shouts():
     return f"✅ 已清理 {count} 筆待處理喊單。" if count else "目前沒有待處理喊單。"
 
 
+def format_shout_content(content):
+    """將司機自由輸入的喊單整理成一致欄位；無法辨識的文字原樣保留。"""
+    aliases = {
+        "駕駛": "駕駛", "司機": "駕駛", "姓名": "駕駛",
+        "車型": "車型", "車款": "車型", "車種": "車型",
+        "車號": "車號", "車牌": "車號", "牌照": "車號",
+        "車色": "車色", "顏色": "車色",
+        "特色": "特色", "備註": "特色", "服務": "特色",
+    }
+    fields = {}
+    extras = []
+
+    raw_lines = re.split(r"[\r\n，,；;]+", str(content or ""))
+    for raw in raw_lines:
+        line = re.sub(r"\s+", " ", raw).strip(" ｜|：:　")
+        if not line:
+            continue
+
+        matched = False
+        for alias, canonical in aliases.items():
+            m = re.match(rf"^{re.escape(alias)}\s*[:：=＝]\s*(.+)$", line, re.I)
+            if m:
+                value = m.group(1).strip()
+                if value:
+                    if canonical in fields:
+                        fields[canonical] += "、" + value
+                    else:
+                        fields[canonical] = value
+                matched = True
+                break
+        if not matched:
+            extras.append(line)
+
+    output = []
+    for label in ("車型", "車號", "車色", "駕駛", "特色"):
+        if fields.get(label):
+            output.append(f"{label}：{fields[label]}")
+    if extras:
+        output.append("其他資訊：" + "；".join(extras))
+    return "\n".join(output) if output else "（未提供喊單內容）"
+
+
 def dispatcher_shout_list():
-    rows = ["📥 司機待處理喊單", "────────────"]
-    for _, order in pending_shouts():
-        source_group = order.get("source_group")
-        source_group_name = order.get("source_group_name") or group_name(source_group)
-        rows.append(
-            f"👤 {order.get('driver_name', '未知司機')}｜群組：{source_group_name}\n"
-            f"{one_line(order.get('content', ''), 160)}"
+    rows = ["📥 司機待處理喊單", "━━━━━━━━━━━━"]
+    grouped = {}
+    for oid, order in pending_shouts():
+        key = (order.get("driver_name", "未知司機"), order.get("source_group"))
+        grouped.setdefault(key, []).append((oid, order))
+
+    for (driver_name, source_group), entries in grouped.items():
+        source_group_name = (
+            entries[0][1].get("source_group_name")
+            or group_name(source_group)
         )
-    if len(rows) == 2:
+        rows.append(f"👤 司機：{driver_name}")
+        rows.append(f"📍 來源群組：{source_group_name}")
+        for index, (_, order) in enumerate(entries, 1):
+            rows.append(f"🚗 喊單 {index}")
+            rows.append(format_shout_content(order.get("content", "")))
+            if index < len(entries):
+                rows.append("────────────")
+        rows.append("━━━━━━━━━━━━")
+
+    if not grouped:
         return "目前沒有待處理喊單。\n輸入「清理全部」可清除所有待處理喊單。"
-    rows.append(
-        "────────────\n"
-        "回覆格式：回 @司機名稱 內容\n"
-        "清理全部 → 清除所有待處理喊單"
-    )
+
+    rows.extend([
+        "回覆格式：回 @司機名稱 內容",
+        "清理全部 → 清除所有待處理喊單",
+    ])
     return "\n".join(rows)
 
 
