@@ -1,4 +1,5 @@
 import json, os, re, threading, time, unicodedata
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -170,6 +171,7 @@ HELP = (
     "指派 司機名 訂單關鍵字 → 指派並公告（標註該司機）\n"
     "取消 訂單關鍵字 → 取消訂單、停止重送\n"
     "列表 → 看未指派的單\n"
+    "狀態 → 檢查綁定與自動重送是否正常\n"
     "（只有一張未指派的單時，關鍵字可省略；有多筆符合會請你回覆 1、1,3 或「全部」選擇）"
 )
 
@@ -305,6 +307,20 @@ def on_private(event, text, src):
             return reply(event.reply_token, ask_choose("cancel", None, items))
         return reply(event.reply_token, do_cancel([items[0][0]]))
 
+    if text == "狀態":
+        alive = "運作中" if RESENDER.is_alive() else "已停止"
+        return reply(event.reply_token,
+                     "📊 狀態\n"
+                     f"管理員綁定：{'是' if S['admin'] else '否'}\n"
+                     f"群組綁定：{'是' if S['group'] else '否'}\n"
+                     f"未指派訂單：{len(open_orders())} 筆\n"
+                     f"重送間隔：{RESEND_INTERVAL} 秒\n"
+                     f"重送執行緒：{alive}\n"
+                     f"服務已運行：{int((time.time() - STATS['started']) // 60)} 分鐘\n"
+                     f"重送成功：{STATS['ok']} 次，失敗：{STATS['err']} 次\n"
+                     f"最近成功：{tw(STATS['last_ok'])}\n"
+                     f"最近錯誤：{STATS['last_err'] or '無'}")
+
     if text == "列表":
         rows = [f"・{one_line(v['content'])}" for _, v in open_orders()]
         return reply(event.reply_token, "\n".join(rows) or "沒有未指派的單")
@@ -313,6 +329,13 @@ def on_private(event, text, src):
 
 # ---------- 自動重送 ----------
 _warned_unbound = False
+STATS = {"started": time.time(), "ok": 0, "err": 0, "last_ok": None, "last_err": None}
+
+def tw(ts):
+    """台灣時間 月/日 時:分:秒"""
+    if not ts:
+        return "無"
+    return datetime.fromtimestamp(ts, timezone(timedelta(hours=8))).strftime("%m/%d %H:%M:%S")
 
 def resend_due():
     """未指派、未取消的訂單，距離上次發送滿 RESEND_INTERVAL 秒就重送到群組。
@@ -335,8 +358,12 @@ def resend_due():
                 push(S["group"],
                      f"🔁 訂單（第{o['resend_count']}次提醒）\n"
                      f"{o['content']}\n\n要接請標註我並回：內容 時間")
+                STATS["ok"] += 1
+                STATS["last_ok"] = time.time()
                 print(f"resend ok: order={order_id} n={o['resend_count']}", flush=True)
             except Exception as e:
+                STATS["err"] += 1
+                STATS["last_err"] = f"{tw(time.time())} {e}"[:300]
                 print(f"resend failed: order={order_id} error={e}", flush=True)
 
 def resender():
@@ -348,7 +375,8 @@ def resender():
         except Exception as e:  # 任何錯誤都不能讓重送執行緒結束
             print("resender error:", e, flush=True)
 
-threading.Thread(target=resender, daemon=True).start()
+RESENDER = threading.Thread(target=resender, daemon=True)
+RESENDER.start()
 
 @app.get("/")
 def health():
