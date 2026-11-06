@@ -161,19 +161,17 @@ def on_group(event, text, src):
     if S["admin"]:
         push(S["admin"],
              f"🙋 {name} 喊單\n{content}\n\n"
-             f"回覆司機：回 {name} 內容\n"
-             f"指派：指派 {name} 訂單關鍵字")
+             f"回覆司機：回 {name} 內容")
 
 # ---------- 管理員私訊 ----------
 HELP = (
     "指令：\n"
     "派單 訂單內容 → 轉發到司機群組\n"
     "回 司機名 內容 → 回覆群組並標註該司機\n"
-    "指派 司機名 訂單關鍵字 → 指派並公告（標註該司機）\n"
     "取消 訂單關鍵字 → 取消訂單、停止重送\n"
-    "列表 → 看未指派的單\n"
+    "列表 → 看進行中的訂單\n"
     "狀態 → 檢查綁定與自動重送是否正常\n"
-    "（只有一張未指派的單時，關鍵字可省略；有多筆符合會請你回覆 1、1,3 或「全部」選擇）"
+    "（只有一張進行中的單時，關鍵字可省略；有多筆符合會請你回覆 1、1,3 或「全部」選擇）"
 )
 
 def parse_driver(rest):
@@ -197,7 +195,7 @@ def one_line(content, n=60):
     return t if len(t) <= n else t[:n - 16] + "…" + t[-15:]  # 保留結尾，因為相同開頭的單常常差在後面
 
 def open_orders(keyword=""):
-    items = [(k, v) for k, v in S["orders"].items() if not v.get("assigned")]
+    items = list(S["orders"].items())
     kw = norm(keyword)
     if kw:
         items = [(k, v) for k, v in items if kw in norm(v["content"])]
@@ -206,23 +204,12 @@ def open_orders(keyword=""):
 # 多筆符合時，暫存管理員的選擇（只存在記憶體，不需要編號）
 PENDING = {}
 
-def ask_choose(action, name, items):
+def ask_choose(items):
     PENDING.clear()
-    PENDING.update(action=action, name=name, ids=[k for k, _ in items])
+    PENDING.update(ids=[k for k, _ in items])
     rows = "\n".join(f"{i}. {one_line(v['content'])}" for i, (_, v) in enumerate(items, 1))
     return (f"有 {len(items)} 筆符合，請回覆要處理哪幾筆：\n{rows}\n\n"
             "回覆「1」、「1,3」或「全部」（回其他內容＝取消這次選擇）")
-
-def do_assign(name, ids):
-    chosen = [S["orders"][i] for i in ids if i in S["orders"] and not S["orders"][i].get("assigned")]
-    if not chosen:
-        return "這些訂單已經不存在或已指派"
-    for o in chosen:
-        o["assigned"] = driver_target(name)
-    save()
-    body = "\n──────\n".join(o["content"] for o in chosen)
-    push_tagged(S["group"], f"✅ 指派給 {name}\n{body}", [driver_target(name)])
-    return f"✅ 已指派 {len(chosen)} 筆給 {name}，停止重送"
 
 def do_cancel(ids):
     chosen = [S["orders"].pop(i) for i in ids if i in S["orders"]]
@@ -262,10 +249,8 @@ def on_private(event, text, src):
                 if any(n < 1 or n > len(ids) for n in picks):
                     return reply(event.reply_token, f"請回覆 1 到 {len(ids)} 之間的數字，或「全部」")
                 ids = [ids[n - 1] for n in sorted(picks)]
-            action, name = PENDING["action"], PENDING.get("name")
             PENDING.clear()
-            return reply(event.reply_token,
-                         do_assign(name, ids) if action == "assign" else do_cancel(ids))
+            return reply(event.reply_token, do_cancel(ids))
         PENDING.clear()
 
     if text.startswith("派單"):
@@ -274,7 +259,7 @@ def on_private(event, text, src):
             return reply(event.reply_token, "請在「派單」後面接訂單內容")
         order_id = str(S["next_id"])  # 內部使用，不顯示給司機
         S["next_id"] += 1
-        S["orders"][order_id] = {"content": body, "assigned": None,
+        S["orders"][order_id] = {"content": body,
                                  "last_sent": time.time(), "resend_count": 0}
         save()
         print(f"dispatch: order={order_id}", flush=True)
@@ -289,23 +274,12 @@ def on_private(event, text, src):
         note = "" if S["drivers"].get(name) else "\n（此司機還沒喊過單，無法真標註，群組只顯示 @名字）"
         return reply(event.reply_token, f"✅ 已回覆並標註：{name}{note}")
 
-    if text.startswith("指派"):
-        name, kw = parse_driver(text[2:])
-        if not name:
-            return reply(event.reply_token, "格式：指派 司機名 訂單關鍵字")
-        items = open_orders(kw)
-        if not items:
-            return reply(event.reply_token, "找不到符合的未指派訂單（可用「列表」查看）")
-        if len(items) > 1:
-            return reply(event.reply_token, ask_choose("assign", name, items))
-        return reply(event.reply_token, do_assign(name, [items[0][0]]))
-
     if text.startswith("取消"):
         items = open_orders(text[2:])
         if not items:
-            return reply(event.reply_token, "找不到符合的未指派訂單（可用「列表」查看）")
+            return reply(event.reply_token, "找不到符合的訂單（可用「列表」查看）")
         if len(items) > 1:
-            return reply(event.reply_token, ask_choose("cancel", None, items))
+            return reply(event.reply_token, ask_choose(items))
         return reply(event.reply_token, do_cancel([items[0][0]]))
 
     if text == "狀態":
@@ -314,7 +288,7 @@ def on_private(event, text, src):
                      "📊 狀態\n"
                      f"管理員綁定：{'是' if S['admin'] else '否'}\n"
                      f"群組綁定：{'是' if S['group'] else '否'}\n"
-                     f"未指派訂單：{len(open_orders())} 筆\n"
+                     f"進行中訂單：{len(open_orders())} 筆\n"
                      f"重送間隔：{RESEND_INTERVAL} 秒\n"
                      f"重送執行緒：{alive}（啟動 {STATS.get('thread_starts', 0)} 次）\n"
                      f"服務已運行：{int((time.time() - STATS['started']) // 60)} 分鐘\n"
@@ -324,7 +298,7 @@ def on_private(event, text, src):
 
     if text == "列表":
         rows = [f"・{one_line(v['content'])}" for _, v in open_orders()]
-        return reply(event.reply_token, "\n".join(rows) or "沒有未指派的單")
+        return reply(event.reply_token, "\n".join(rows) or "沒有進行中的訂單")
 
     reply(event.reply_token, HELP)
 
@@ -339,8 +313,8 @@ def tw(ts):
     return datetime.fromtimestamp(ts, timezone(timedelta(hours=8))).strftime("%m/%d %H:%M:%S")
 
 def resend_due():
-    """未指派、未取消的訂單，距離上次發送滿 RESEND_INTERVAL 秒就重送到群組。
-    取消（pop）或指派後就不再重送。"""
+    """進行中（未取消）的訂單，距離上次發送滿 RESEND_INTERVAL 秒就重送到群組。
+    取消（pop）後就不再重送。"""
     global _warned_unbound
     if not S["group"]:
         if S["orders"] and not _warned_unbound:
@@ -350,14 +324,12 @@ def resend_due():
     _warned_unbound = False
     now = time.time()
     for order_id, o in list(S["orders"].items()):
-        if o.get("assigned"):
-            continue
         if now - o.get("last_sent", 0) >= RESEND_INTERVAL:  # 舊資料沒有 last_sent 也會重送
             o["last_sent"] = now
             o["resend_count"] = o.get("resend_count", 0) + 1
             try:
                 push(S["group"],
-                     f"🔁 訂單（第{o['resend_count']}次提醒）\n"
+                     f"🔁 自動刷單\n"
                      f"{o['content']}\n\n要接請標註我並回：內容 時間")
                 STATS["ok"] += 1
                 STATS["last_ok"] = time.time()
