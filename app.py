@@ -316,7 +316,6 @@ def dispatcher_shout_list():
     rows.append(
         "────────────\n"
         "回覆格式：回 @司機名稱 內容\n"
-        "完成格式：ok（只有一筆待處理喊單時）；多筆請用 ok @司機名稱"
     )
     return "\n".join(rows)
 
@@ -434,7 +433,7 @@ def on_group(event, text, src):
 def on_driver_group(event, text, src):
     tok, uid = event.reply_token, src.user_id
 
-    if text in ("使用說明", "幫助", "help"):
+    if text in ("使用說明", "幫助", "help", "/help"):
         return driver_group_reply(event, DRIVER_HELP)
     if text in ("訂單列表", "可接訂單", "列表"):
         return driver_group_reply(event, active_order_list())
@@ -450,18 +449,7 @@ def on_driver_group(event, text, src):
     if mentioned and rest:
         return record_shout(event, src.group_id, uid, rest)
 
-    if text == "取消我的喊單":
-        name = get_driver_name(src.group_id, uid)
-        found = 0
-        for o in S["orders"].values():
-            if o.get("kind") == "shout" and o.get("driver_user_id") == uid and o.get("status") == "pending":
-                o["status"] = "cancelled"
-                o["updated_at"] = now_tw()
-                found += 1
-        save()
-        return driver_group_reply(event, f"已取消你 {found} 筆待處理喊單。")
 
-    # 一般訊息也可觸發待通知佇列與 5 秒／30 秒自動刷單。
     return driver_group_reply(event)
 
 
@@ -475,7 +463,7 @@ def on_dispatcher_group(event, text, src):
     cmd = rest if mentioned else text
     cmd = cmd.strip()
 
-    if cmd in ("使用說明", "幫助", "help"):
+    if cmd in ("使用說明", "幫助", "help", "/help"):
         return reply(tok, DISPATCHER_HELP)
     if cmd in ("喊單列表", "待處理喊單", "喊單"):
         return reply(tok, dispatcher_shout_list())
@@ -550,21 +538,6 @@ def on_dispatcher_group(event, text, src):
         queue_driver_notification(notice, driver_user_id=driver_user_id, driver_name=driver_name)
         return reply(tok, f"已將通知排入 {driver_name} 的待通知佇列；司機下次在司機群組發言時收到，不使用 Push。")
 
-    m = re.match(r"^取消訂單\s+(\d+)$", cmd)
-    if m:
-        oid = m.group(1)
-        order = S["orders"].get(oid)
-        if not order:
-            return reply(tok, f"找不到訂單 #{oid}。")
-        order["status"] = "cancelled"
-        order["updated_at"] = now_tw()
-        save()
-        target = order.get("driver_name") or order.get("assigned_driver") or "相關司機"
-        queue_driver_notification(f"🚫 訂單取消通知\n👤 對象：@{target}\n🔖 訂單編號：#{oid}\n📝 原訂單：{one_line(order.get('content', ''), 300)}",
-                                  driver_user_id=order.get("driver_user_id"), driver_name=target,
-                                  quote_token=order.get("quote_token"), order_id=oid)
-        return reply(tok, f"已取消訂單 #{oid}。取消通知已排入佇列，不使用 Push；司機下次在司機群組發言時收到。")
-
     return reply(tok, DISPATCHER_HELP)
 
 
@@ -592,7 +565,7 @@ def on_private(event, text, src):
         return reply(tok, "此機器人僅限已授權管理員使用。")
     if text == "狀態":
         return reply(tok, status_text())
-    if text == "幫助":
+    if text in ("幫助", "help", "/help"):
         return reply(tok, PRIVATE_HELP)
     return reply(tok, PRIVATE_HELP)
 
@@ -616,35 +589,40 @@ def status_text():
 
 # ---------------- 指令說明 ----------------
 DRIVER_HELP = (
-    "🚗 司機群組指令\n"
-    "喊單 桃園機場 18:30 → 登記喊單\n"
-    "訂單列表 → 查看目前可接訂單\n"
-    "取消我的喊單 → 取消自己的待處理喊單\n"
-    "\n派單員指定司機、回覆或取消時，通知會先排入佇列；司機在本群組下一次發言時，機器人以 Reply 自動送出，不需輸入查看回覆。"
+    "🚗 CAR SPEED｜司機群組指令\\n"
+    "【喊單】\\n"
+    "喊單 訂單內容／地點／時間 → 登記喊單（也可用：喊、+1）\\n"
+    "\\n【查詢】\\n"
+    "訂單列表 → 查看目前可接訂單\\n"
+    "\\n派單員回覆或通知會在你下一次於司機群組發言時，由機器人自動 Reply。"
 )
 
 DISPATCHER_HELP = (
-    "🧑‍💼 派單員群組指令（管理員）\\n"
-    "喊單列表 → 查看司機待處理喊單（不顯示喊單編號）\\n"
-    "回 @司機名稱 內容 → 回覆該司機最新待處理喊單\\n"
-    "派單 訂單內容 → 建立可接訂單\\n"
-    "訂單列表 → 查看進行中訂單\\n"
-    "取消訂單 編號 → 取消單筆訂單\\n"
+    "🧑‍💼 CAR SPEED｜派單員群組指令\\n"
+    "【一、喊單處理】\\n"
+    "喊單列表 → 查看司機待處理喊單\\n"
+    "回 @司機名稱 內容 → 引用該司機最新喊單並回覆\\n"
+    "\\n【二、派單管理】\\n"
+    "派單 訂單內容 → 新增可接訂單\\n"
+    "訂單列表 → 查看目前進行中的訂單\\n"
     "取消 → 結束全部進行中派單並公告\\n"
+    "\\n【三、系統查詢】\\n"
     "狀態 → 查看系統狀態\\n"
-    "\\n司機喊單不在司機群組顯示紀錄；派單員回覆會引用原喊單並標註司機。派單內容與回覆通知分開發送，不共用引用。"
+    "/help／使用說明 → 顯示本指令列表\\n"
+    "\\n注意：喊單列表不顯示喊單編號；派單員回覆會引用原始喊單，普通派單內容則獨立發送。"
 )
 
 PRIVATE_HELP = (
-    "CAR SPEED 管理員私訊指令\n"
-    "狀態 → 查看雙群組綁定及系統狀態\n"
-    "幫助 → 查看使用說明\n\n"
-    "首次設定：\n"
-    "1. 將機器人加入司機群組，主管理員輸入「綁定司機群組」\n"
-    "2. 將機器人加入派單員群組，主管理員輸入「綁定派單群組」\n"
-    "3. 其他派單員私訊機器人輸入「我是管理員 密碼」取得管理權限；所有已授權管理員均可綁定司機群組及派單員群組。"
+    "⚙️ CAR SPEED｜管理員私訊指令\\n"
+    "【系統】\\n"
+    "狀態 → 查看雙群組綁定及系統狀態\\n"
+    "/help／幫助 → 查看管理員使用說明\\n"
+    "\\n【群組綁定】（所有已授權管理員皆可）\\n"
+    "在司機群組輸入：綁定司機群組\\n"
+    "在派單員群組輸入：綁定派單群組\\n"
+    "\\n【新增管理員】\\n"
+    "私訊機器人輸入：我是管理員 密碼"
 )
-
 
 # ---------------- 標註解析 ----------------
 def strip_self_mention(message):
