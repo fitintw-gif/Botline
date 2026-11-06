@@ -10,7 +10,7 @@ from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
-    ReplyMessageRequest, TextMessage,
+    ReplyMessageRequest, TextMessage, Mention, Mentionee,
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent, GroupSource, UserSource
 
@@ -157,7 +157,6 @@ def driver_group_reply(event, text=None, allow_passive=True):
             first_due.append((oid, order))
 
     last_passive = float(S.get("last_passive_ts", 0) or 0)
-    # 新派單必須先等滿 5 秒；在首次刷單送出前，不可被「上次時間為 0」誤判成立即到期。
     waiting_first = any(
         order.get("kind") == "dispatch" and not order.get("first_reply_sent")
         for _, order in orders
@@ -165,25 +164,60 @@ def driver_group_reply(event, text=None, allow_passive=True):
     regular_refresh_due = (not waiting_first) and (now - last_passive >= RESEND_INTERVAL)
     passive_due = bool(allow_passive and orders and (first_due or regular_refresh_due))
 
-    messages = []
+    parts = []
     if text:
-        messages.append(str(text))
-    if ready:
-        for item in ready:
-            messages.append(item.get("text", "📣 有一筆派單通知，請查看。"))
+        parts.append({"text": str(text), "user_id": None})
+    for item in ready:
+        parts.append({
+            "text": item.get("text", "📣 有一筆派單通知，請查看。"),
+            "user_id": item.get("driver_user_id"),
+        })
     if passive_due:
-        body = "\n──────\n".join(f"#{oid} {o.get('content','')}" for oid, o in orders)
+        body = "\\n──────\\n".join(f"{o.get('content','')}" for _, o in orders)
         heading = "🔄 自動刷單｜首次更新" if first_due else "🔄 自動刷單｜訂單更新"
-        messages.append(f"{heading}\n{body}\n\n以上為目前有效訂單；新訂單及狀態變更會在後續刷單更新。")
+        parts.append({
+            "text": f"{heading}\\n{body}\\n\\n以上為目前有效訂單。",
+            "user_id": None,
+        })
 
-    if not messages:
+    if not parts:
         return
 
-    # 一次 Reply Token 只送一次；若只有一筆引用通知，保留原喊單 quoteToken。
+    chunks = []
+    mentionees = []
+    cursor = 0
+    for part in parts:
+        if chunks:
+            cursor += len("\\n\\n────────────\\n\\n".encode("utf-16-le")) // 2
+        part_text = part["text"]
+        user_id = part.get("user_id")
+        if user_id:
+            driver_name = next(
+                (name for name, saved_uid in S.get("drivers", {}).items() if saved_uid == user_id),
+                None
+            )
+            if driver_name:
+                prefix = f"@{driver_name}"
+                # 確保通知文字以被標註司機開頭，讓 mention index 穩定可計算。
+                if not part_text.startswith(prefix):
+                    part_text = prefix + "\\n" + part_text
+                mentionees.append(Mentionee(
+                    index=cursor,
+                    length=len(prefix.encode("utf-16-le")) // 2,
+                    user_id=user_id
+                ))
+        chunks.append(part_text)
+        cursor += len(part_text.encode("utf-16-le")) // 2
+
+    body = "\\n\\n────────────\\n\\n".join(chunks)
+    if len(body) > 4900:
+        body = body[:4880] + "\\n…（內容過長，已截斷）"
+        mentionees = [m for m in mentionees if m.index < len(body.encode("utf-16-le")) // 2]
+
     quote_token = ready[0].get("quote_token") if len(ready) == 1 else None
-    body = "\n\n────────────\n\n".join(messages)
     try:
-        msg = TextMessage(text=body[:4900], quote_token=quote_token) if quote_token else TextMessage(text=body[:4900])
+        mention = Mention(mentionees=mentionees) if mentionees else None
+        msg = TextMessage(text=body, quote_token=quote_token, mention=mention)
         with ApiClient(config) as c:
             MessagingApi(c).reply_message(
                 ReplyMessageRequest(reply_token=event.reply_token, messages=[msg]))
@@ -245,11 +279,11 @@ def pending_shouts():
 def dispatcher_shout_list():
     rows = ["📥 司機待處理喊單", "────────────"]
     for oid, o in pending_shouts():
-        rows.append(f"#{oid}｜{o.get('driver_name','未知司機')}｜{o.get('created_at','')}\n{one_line(o.get('content',''), 160)}")
+        rows.append(f"👤 {o.get('driver_name','未知司機')}｜{o.get('created_at','')}\\n{one_line(o.get('content',''), 160)}")
     if len(rows) == 2:
         return "目前沒有待處理喊單。"
-    rows.append("────────────\n回覆格式：回喊單 編號 回覆內容\n完成格式：完成喊單 編號")
-    return "\n".join(rows)
+    rows.append("────────────\\n回覆格式：回 @司機名稱 內容\\n完成格式：ok（僅有一筆待處理喊單時）")
+    return "\\n".join(rows)
 
 
 def active_order_list():
@@ -302,7 +336,7 @@ def record_shout(event, group_id, user_id, content):
     save()
     return driver_group_reply(
         event,
-        f"✅ 喊單已記錄 #{oid}\n{name}：{content}\n\n派單員可在派單員群組輸入「喊單列表」查看。"
+        f"✅ 喊單已記錄\n{name}：{content}\n\n派單員可在派單員群組輸入「喊單列表」查看。"
     )
 
 
@@ -437,16 +471,14 @@ def on_dispatcher_group(event, text, src):
         # 使用該事件的 Reply Token 做首次自動刷單；首次刷單後恢復每 30 秒被動 Reply。
         return reply(tok, f"✅ 訂單已建立 #{oid}\n{content}\n\n自動刷單：建立 5 秒後，司機群組有新訊息事件時首次 Reply 更新；之後每 {RESEND_INTERVAL} 秒，有新訊息事件時再 Reply 更新。")
 
-    # @司機名稱 內容：將帶有司機標示的通知直接送到司機群組。
-    # 這裡的 @ 是文字標示；司機不在派單員群組，不能在派單員群組原生 mention。
-    m = re.match(r"^[@＠](.+?)\s+(.+)$", cmd, re.S)
+    # 回 @司機名稱 內容：派單員用簡短格式回覆指定司機最新待處理喊單。
+    m = re.match(r"^回\\s+[@＠]?(.+?)\\s+(.+)$", cmd, re.S)
     if m:
         driver_name, message = m.group(1).strip(), m.group(2).strip()
         driver_user_id = S.get("drivers", {}).get(driver_name)
         if not driver_user_id:
             known = "、".join(S.get("drivers", {}).keys()) or "尚無已記錄司機"
-            return reply(tok, f"找不到司機「{driver_name}」。\n已記錄司機：{known}\n\n請確認司機曾在司機群組發言或喊單。")
-        # 優先找到該司機最新一筆待處理喊單，並引用那則原始喊單。
+            return reply(tok, f"找不到司機「{driver_name}」。\\n已記錄司機：{known}")
         shout = next((o for _, o in reversed(list(S["orders"].items()))
                       if o.get("kind") == "shout"
                       and o.get("status") == "pending"
@@ -457,43 +489,65 @@ def on_dispatcher_group(event, text, src):
         shout["updated_at"] = now_tw()
         shout["dispatcher_reply"] = message
         save()
-        notice = f"📣 派單員回覆\n👤 司機：{driver_name}\n🔖 喊單編號：#{next((oid for oid, o in S['orders'].items() if o is shout), '')}\n📝 {message}\n🕒 {now_tw()}"
+        notice = f"派單員回覆：{message}"
         queue_driver_notification(notice, driver_user_id=driver_user_id, driver_name=driver_name,
-                                  quote_token=shout.get("quote_token"), order_id=next((oid for oid, o in S["orders"].items() if o is shout), None))
-        quote_note = "（司機下次發言時引用原始喊單回覆）" if shout.get("quote_token") else "（司機下次發言時以 Reply 通知）"
-        return reply(tok, f"✅ 已登記回覆 {driver_name}{quote_note}。\n不使用 Push；等待該司機在司機群組下一次發言時送出。")
+                                  quote_token=shout.get("quote_token"))
+        return reply(tok, f"✅ 已登記回覆 {driver_name}。\\n司機下次在司機群組發言時，機器人會引用原喊單並原生標註司機回覆。")
 
-    m = re.match(r"^回喊單\s+(\d+)\s+(.+)$", cmd, re.S)
+    # 相容舊格式 @司機名稱 內容。
+    m = re.match(r"^[@＠](.+?)\\s+(.+)$", cmd, re.S)
     if m:
-        oid, message = m.group(1), m.group(2).strip()
-        order = S["orders"].get(oid)
-        if not order or order.get("kind") != "shout" or order.get("status") != "pending":
-            return reply(tok, f"找不到待處理喊單 #{oid}。請先輸入「喊單列表」。")
-        driver_name = order.get("driver_name", "")
-        order["status"] = "replied"
-        order["updated_at"] = now_tw()
-        order["dispatcher_reply"] = message
+        driver_name, message = m.group(1).strip(), m.group(2).strip()
+        driver_user_id = S.get("drivers", {}).get(driver_name)
+        if not driver_user_id:
+            known = "、".join(S.get("drivers", {}).keys()) or "尚無已記錄司機"
+            return reply(tok, f"找不到司機「{driver_name}」。\\n已記錄司機：{known}")
+        shout = next((o for _, o in reversed(list(S["orders"].items()))
+                      if o.get("kind") == "shout"
+                      and o.get("status") == "pending"
+                      and o.get("driver_user_id") == driver_user_id), None)
+        if not shout:
+            return reply(tok, f"找不到 {driver_name} 尚待處理的喊單。")
+        shout["status"] = "replied"
+        shout["updated_at"] = now_tw()
+        shout["dispatcher_reply"] = message
         save()
-        notice = f"📣 喊單處理通知\n👤 司機：@{driver_name}\n🔖 喊單編號：#{oid}\n📝 派單員回覆：{message}\n🕒 時間：{now_tw()}"
-        queue_driver_notification(notice, driver_user_id=order.get("driver_user_id"), driver_name=driver_name,
-                                  quote_token=order.get("quote_token"), order_id=oid)
-        quote_note = "司機下次發言時引用原始喊單回覆。" if order.get("quote_token") else "司機下次發言時以 Reply 通知。"
-        return reply(tok, f"已處理喊單 #{oid}（{driver_name}）。\n{quote_note}\n已加入待通知佇列，不使用 Push。\n回覆內容：{message}")
+        queue_driver_notification(f"派單員回覆：{message}", driver_user_id=driver_user_id,
+                                  driver_name=driver_name, quote_token=shout.get("quote_token"))
+        return reply(tok, f"✅ 已登記回覆 {driver_name}，等待司機群組下一次訊息事件 Reply。")
 
-    m = re.match(r"^完成喊單\s+(\d+)$", cmd)
-    if m:
-        oid = m.group(1)
-        order = S["orders"].get(oid)
-        if not order or order.get("kind") != "shout" or order.get("status") != "pending":
-            return reply(tok, f"找不到待處理喊單 #{oid}。")
+    # ok：若只有一筆待處理喊單，直接標記完成；多筆時要求指定司機避免誤結案。
+    if cmd.lower() == "ok":
+        pending = pending_shouts()
+        if not pending:
+            return reply(tok, "目前沒有待處理喊單。")
+        if len(pending) > 1:
+            names = "、".join(dict.fromkeys(o.get("driver_name", "未知司機") for _, o in pending))
+            return reply(tok, f"目前有 {len(pending)} 筆待處理喊單，為避免完成錯誤，請輸入：ok @司機名稱\\n待處理司機：{names}")
+        oid, order = pending[0]
+    else:
+        m = re.match(r"^ok\\s+[@＠]?(.+)$", cmd, re.I)
+        if not m:
+            m = None
+        if m:
+            driver_name = m.group(1).strip()
+            match = next(((oid, o) for oid, o in reversed(list(S["orders"].items()))
+                          if o.get("kind") == "shout" and o.get("status") == "pending"
+                          and o.get("driver_name") == driver_name), None)
+            if not match:
+                return reply(tok, f"找不到 {driver_name} 的待處理喊單。")
+            oid, order = match
+        else:
+            oid = order = None
+
+    if cmd.lower() == "ok" or re.match(r"^ok\\s+[@＠]?.+$", cmd, re.I):
         order["status"] = "completed"
         order["updated_at"] = now_tw()
         save()
         driver_name = order.get("driver_name", "未知司機")
-        queue_driver_notification(f"✅ 喊單已完成\n👤 司機：@{driver_name}\n🔖 喊單編號：#{oid}",
-                                  driver_user_id=order.get("driver_user_id"), driver_name=driver_name,
-                                  quote_token=order.get("quote_token"), order_id=oid)
-        return reply(tok, f"喊單 #{oid} 已標記完成，通知已排入佇列；司機下次在司機群組發言時收到。")
+        queue_driver_notification("✅ 喊單已完成。", driver_user_id=order.get("driver_user_id"),
+                                  driver_name=driver_name, quote_token=order.get("quote_token"))
+        return reply(tok, f"✅ 已完成 {driver_name} 的喊單；通知已排入佇列，司機下次在司機群組發言時收到。")
 
     m = re.match(r"^回司機\s+(.+?)\s+(.+)$", cmd, re.S)
     if m:
@@ -579,18 +633,16 @@ DRIVER_HELP = (
 )
 
 DISPATCHER_HELP = (
-    "🧑‍💼 派單員群組指令（管理員）\n"
-    "喊單列表 → 查看司機待處理喊單\n"
-    "回喊單 編號 回覆內容 → 將回覆排入該司機通知佇列\n"
-    "@司機名稱 內容 → 引用該司機最新待處理喊單，排入通知佇列\n"
-    "完成喊單 編號 → 完成喊單\n"
-    "派單 訂單內容 → 建立可接訂單\n"
-    "訂單列表 → 查看進行中訂單\n"
-    "回司機 司機名稱 內容 → 將指定訊息排入該司機通知佇列\n"
-    "取消訂單 編號 → 取消單筆訂單\n"
-    "取消 → 取消全部進行中派單\n"
-    "狀態 → 查看系統狀態\n"
-    "\n注意：派單員對司機的指定、回覆及取消通知會先存入待通知佇列，不使用 Push；指定司機需在司機群組下一次發言時，機器人才可使用該事件 Reply Token 回覆，並可引用原始喊單。自動刷單：新派單建立 5 秒後，司機群組有新訊息事件時首次 Reply 顯示最新有效訂單；之後每 30 秒（可由 RESEND_INTERVAL 設定），在司機群組有新訊息事件時 Reply 更新訂單列表。沒有有效訂單就不刷單。這是事件觸發式 Reply，不是背景定時 Push；若群組沒有人發言，機器人不會自行發訊息。@司機名稱是文字指令，不是 LINE 原生 mention。"
+    "🧑‍💼 派單員群組指令（管理員）\\n"
+    "喊單列表 → 查看司機待處理喊單（不顯示編號）\\n"
+    "回 @司機名稱 內容 → 回覆該司機最新待處理喊單\\n"
+    "ok → 完成唯一一筆待處理喊單；若有多筆，使用 ok @司機名稱\\n"
+    "派單 訂單內容 → 建立可接訂單\\n"
+    "訂單列表 → 查看進行中訂單\\n"
+    "取消訂單 編號 → 取消單筆訂單\\n"
+    "取消 → 取消全部進行中派單\\n"
+    "狀態 → 查看系統狀態\\n"
+    "\\n司機回覆及完成通知會排入佇列；司機群組有新訊息時，機器人使用 Reply 引用原喊單並原生標註司機。"
 )
 
 PRIVATE_HELP = (
