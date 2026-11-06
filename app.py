@@ -10,7 +10,10 @@ from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
-    ReplyMessageRequest, TextMessage, Mention, Mentionee,
+    ReplyMessageRequest, TextMessage,
+)
+from linebot.v3.messaging.models import (
+    TextMessageV2, MentionSubstitutionObject, UserMentionTarget,
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent, GroupSource, UserSource
 
@@ -143,7 +146,10 @@ def driver_group_reply(event, text=None, allow_passive=True):
     uid = event.source.user_id
     now = time.time()
     queue = S.setdefault("pending_notifications", [])
-    ready = [n for n in queue if not n.get("driver_user_id") or n.get("driver_user_id") == uid]
+    ready = [
+        item for item in queue
+        if not item.get("driver_user_id") or item.get("driver_user_id") == uid
+    ]
 
     orders = active_orders()
     first_due = []
@@ -153,7 +159,8 @@ def driver_group_reply(event, text=None, allow_passive=True):
         if "first_reply_after" not in order:
             order["first_reply_after"] = now + 5
             order["first_reply_sent"] = False
-        if not order.get("first_reply_sent") and now >= float(order.get("first_reply_after", now + 5)):
+        if (not order.get("first_reply_sent")
+                and now >= float(order.get("first_reply_after", now + 5))):
             first_due.append((oid, order))
 
     last_passive = float(S.get("last_passive_ts", 0) or 0)
@@ -161,80 +168,110 @@ def driver_group_reply(event, text=None, allow_passive=True):
         order.get("kind") == "dispatch" and not order.get("first_reply_sent")
         for _, order in orders
     )
-    regular_refresh_due = (not waiting_first) and (now - last_passive >= RESEND_INTERVAL)
-    passive_due = bool(allow_passive and orders and (first_due or regular_refresh_due))
+    regular_refresh_due = (
+        not waiting_first and now - last_passive >= RESEND_INTERVAL
+    )
+    passive_due = bool(
+        allow_passive and orders and (first_due or regular_refresh_due)
+    )
 
     parts = []
     if text:
-        parts.append({"text": str(text), "user_id": None})
+        parts.append({"text": str(text), "driver_user_id": None})
     for item in ready:
         parts.append({
             "text": item.get("text", "📣 有一筆派單通知，請查看。"),
-            "user_id": item.get("driver_user_id"),
+            "driver_user_id": item.get("driver_user_id"),
         })
     if passive_due:
-        body = "\\n──────\\n".join(f"{o.get('content','')}" for _, o in orders)
-        heading = "🔄 自動刷單｜首次更新" if first_due else "🔄 自動刷單｜訂單更新"
+        body = "\n──────\n".join(
+            str(order.get("content", "")) for _, order in orders
+        )
+        heading = (
+            "🔄 自動刷單｜首次更新"
+            if first_due else "🔄 自動刷單｜訂單更新"
+        )
         parts.append({
-            "text": f"{heading}\\n{body}\\n\\n以上為目前有效訂單。",
-            "user_id": None,
+            "text": f"{heading}\n{body}\n\n以上為目前有效訂單。",
+            "driver_user_id": None,
         })
 
     if not parts:
         return
 
     chunks = []
-    mentionees = []
-    cursor = 0
+    substitutions = {}
+    mention_count = 0
     for part in parts:
-        if chunks:
-            cursor += len("\\n\\n────────────\\n\\n".encode("utf-16-le")) // 2
         part_text = part["text"]
-        user_id = part.get("user_id")
-        if user_id:
+        driver_user_id = part.get("driver_user_id")
+
+        if driver_user_id:
             driver_name = next(
-                (name for name, saved_uid in S.get("drivers", {}).items() if saved_uid == user_id),
-                None
+                (
+                    name for name, saved_uid in S.get("drivers", {}).items()
+                    if saved_uid == driver_user_id
+                ),
+                None,
             )
-            if driver_name:
-                prefix = f"@{driver_name}"
-                # 確保通知文字以被標註司機開頭，讓 mention index 穩定可計算。
-                if not part_text.startswith(prefix):
-                    part_text = prefix + "\\n" + part_text
-                mentionees.append(Mentionee(
-                    index=cursor,
-                    length=len(prefix.encode("utf-16-le")) // 2,
-                    user_id=user_id
-                ))
+            if driver_name and mention_count < 20:
+                key = f"driver{mention_count}"
+                placeholder = "{" + key + "}"
+                part_text = f"{placeholder}\n{part_text}"
+                substitutions[key] = MentionSubstitutionObject(
+                    mentionee=UserMentionTarget(user_id=driver_user_id)
+                )
+                mention_count += 1
+            elif driver_name:
+                part_text = f"@{driver_name}\n{part_text}"
+
         chunks.append(part_text)
-        cursor += len(part_text.encode("utf-16-le")) // 2
 
-    body = "\\n\\n────────────\\n\\n".join(chunks)
+    body = "\n\n────────────\n\n".join(chunks)
     if len(body) > 4900:
-        body = body[:4880] + "\\n…（內容過長，已截斷）"
-        mentionees = [m for m in mentionees if m.index < len(body.encode("utf-16-le")) // 2]
+        body = body[:4880] + "\n…（內容過長，已截斷）"
 
-    quote_token = ready[0].get("quote_token") if len(ready) == 1 else None
+    quote_token = (
+        ready[0].get("quote_token")
+        if len(ready) == 1 and ready[0].get("driver_user_id") == uid
+        else None
+    )
+
     try:
-        mention = Mention(mentionees=mentionees) if mentionees else None
-        msg = TextMessage(text=body, quote_token=quote_token, mention=mention)
-        with ApiClient(config) as c:
-            MessagingApi(c).reply_message(
-                ReplyMessageRequest(reply_token=event.reply_token, messages=[msg]))
-    except Exception as e:
-        STATS["last_err"] = f"{now_tw()} {err_text(e)}"
-        print("driver group reply failed:", err_text(e), flush=True)
+        if substitutions or quote_token:
+            message = TextMessageV2(
+                text=body,
+                substitution=substitutions or None,
+                quote_token=quote_token,
+            )
+        else:
+            message = TextMessage(text=body)
+
+        with ApiClient(config) as client:
+            MessagingApi(client).reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[message],
+                )
+            )
+    except Exception as exc:
+        STATS["last_err"] = f"{now_tw()} {err_text(exc)}"
+        print("driver group reply failed:", err_text(exc), flush=True)
         return
 
     if ready:
-        ready_ids = {n.get("id") for n in ready}
-        S["pending_notifications"] = [n for n in queue if n.get("id") not in ready_ids]
+        sent_ids = {item.get("id") for item in ready}
+        S["pending_notifications"] = [
+            item for item in queue if item.get("id") not in sent_ids
+        ]
+
     if passive_due:
         for _, order in first_due:
             order["first_reply_sent"] = True
             order["first_reply_sent_at"] = now
         S["last_passive_ts"] = now
         STATS["passive"] += 1
+
     if ready or passive_due:
         save()
 
