@@ -1,3 +1,4 @@
 flask
 line-bot-sdk
 gunicorn
+line-bot-sdk>=3.26.0
