@@ -409,20 +409,20 @@ def on_message(event):
 def on_group(event, text, src):
     uid, gid, tok = src.user_id, src.group_id, event.reply_token
 
-    # 兩個群組分開綁定；只有主管理員可執行。
+    # 兩個群組分開綁定；所有已授權管理員（包含主管理員）均可執行。
     if text in ("綁定司機群組", "綁定群組"):
-        if uid != S.get("admin"):
-            return reply(tok, "只有主管理員可以綁定司機群組。")
+        if not is_admin(uid):
+            return reply(tok, "⛔ 只有已授權管理員可以綁定司機群組。")
         S["driver_group"] = gid
         save()
-        return reply(tok, "✅ 已綁定為【司機群組】。司機在此喊單，派單員到另一群組查看。")
+        return reply(tok, "✅ 已由管理員綁定為【司機群組】。司機在此喊單，派單員到另一群組查看。")
 
     if text == "綁定派單群組":
-        if uid != S.get("admin"):
-            return reply(tok, "只有主管理員可以綁定派單員群組。")
+        if not is_admin(uid):
+            return reply(tok, "⛔ 只有已授權管理員可以綁定派單員群組。")
         S["dispatcher_group"] = gid
         save()
-        return reply(tok, "✅ 已綁定為【派單員群組】。管理員可在此查看喊單及處理訂單。")
+        return reply(tok, "✅ 已由管理員綁定為【派單員群組】。管理員可在此查看喊單及處理訂單。")
 
     # 僅接受已綁定的兩個群組，其餘群組完全不處理。
     if gid == S.get("dispatcher_group"):
@@ -642,7 +642,7 @@ PRIVATE_HELP = (
     "首次設定：\n"
     "1. 將機器人加入司機群組，主管理員輸入「綁定司機群組」\n"
     "2. 將機器人加入派單員群組，主管理員輸入「綁定派單群組」\n"
-    "3. 其他派單員私訊機器人輸入「我是管理員 密碼」取得管理權限。"
+    "3. 其他派單員私訊機器人輸入「我是管理員 密碼」取得管理權限；所有已授權管理員均可綁定司機群組及派單員群組。"
 )
 
 
