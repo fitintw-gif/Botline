@@ -147,11 +147,9 @@ def driver_group_reply(event, text=None, allow_passive=True):
     now = time.time()
     queue = S.setdefault("pending_notifications", [])
 
-    # 只取未指定對象或指定給目前發言司機的通知。
-    ready = [
-        item for item in queue
-        if not item.get("driver_user_id") or item.get("driver_user_id") == uid
-    ]
+    # 只要司機群組有人發言，就處理所有已排隊通知；
+    # 引文引用原喊單，原生標註仍指向被回覆的目標司機，不要求本人發言。
+    ready = list(queue)
 
     orders = active_orders()
     first_due = []
@@ -526,7 +524,7 @@ def on_dispatcher_group(event, text, src):
             driver_name=matched_name,
             quote_token=shout.get("quote_token")
         )
-        return reply(tok, f"✅ 已登記回覆 {matched_name}。\n司機下次在司機群組發言時，機器人會引用原喊單並原生標註司機回覆。")
+        return reply(tok, f"✅ 已登記回覆 {matched_name}。\n司機群組下次只要有人發言，機器人就會引用原喊單並原生標註 {matched_name} 回覆；不需要該司機本人發言。")
 
     m = re.match(r"^回司機\s+(.+?)\s+(.+)$", cmd, re.S)
     if m:
