@@ -3,13 +3,14 @@ import os
 import re
 import time
 import tempfile
+import uuid
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
-    ReplyMessageRequest, PushMessageRequest, TextMessage,
+    ReplyMessageRequest, TextMessage,
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent, GroupSource, UserSource
 
@@ -17,8 +18,8 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent, GroupSource, U
 # CAR SPEED 雙群組版
 # 司機群組：司機喊單、接收派單／指定司機／取消通知
 # 派單員群組：管理員查看喊單、發布訂單、指定司機及管理訂單
-# 派單員指定司機後，機器人直接將標示訊息推送到司機群組，
-# 司機不需要再輸入「查看回覆」。跨群組即時通知會使用 Push API 並計入訊息額度。
+# 派單員指定司機／回覆／取消：先寫入待通知佇列，不使用 Push API。
+# 司機群組下一次有訊息事件時，機器人用該事件 Reply Token 合併送出待通知。
 # ============================================================
 
 CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
@@ -37,7 +38,7 @@ def default_state():
         "admin": None, "admins": [],
         "driver_group": None, "dispatcher_group": None,
         "next_id": 1, "orders": {}, "drivers": {},
-        "dispatcher_replies": [], "seen_message_ids": []
+        "dispatcher_replies": [], "pending_notifications": [], "last_passive_ts": 0.0, "seen_message_ids": []
     }
 
 
@@ -59,7 +60,7 @@ def load():
     for key in ("orders", "drivers"):
         if not isinstance(data.get(key), dict):
             data[key] = {}
-    for key in ("admins", "dispatcher_replies", "seen_message_ids"):
+    for key in ("admins", "dispatcher_replies", "pending_notifications", "seen_message_ids"):
         if not isinstance(data.get(key), list):
             data[key] = []
     return data
@@ -94,7 +95,6 @@ def save():
 
 save()
 STATS = {"started": time.time(), "passive": 0, "last_err": None}
-LAST_PASSIVE = 0.0
 
 
 def now_tw():
@@ -120,32 +120,89 @@ def reply(token, text):
             ReplyMessageRequest(reply_token=token, messages=[TextMessage(text=text)]))
 
 
-def push_driver_group(text, quote_token=None):
-    """推送到司機群組；如有原始喊單 quoteToken，則以引用訊息方式呈現。
+def queue_driver_notification(text, driver_user_id=None, driver_name=None, quote_token=None, order_id=None):
+    """只寫入待通知佇列；不呼叫 Push API，等待司機群組下一個可用 Reply Token。"""
+    item = {
+        "id": uuid.uuid4().hex,
+        "text": str(text),
+        "driver_user_id": driver_user_id,
+        "driver_name": driver_name,
+        "quote_token": quote_token,
+        "order_id": str(order_id) if order_id is not None else None,
+        "created_at": now_tw(),
+    }
+    S.setdefault("pending_notifications", []).append(item)
+    # 防止狀態檔無限制增長；保留最近 500 筆待通知。
+    S["pending_notifications"] = S["pending_notifications"][-500:]
+    save()
+    return item
 
-    注意：跨群組的延遲通知不能使用原始 webhook Reply Token，仍須使用 Push API；
-    quoteToken 只負責引用原文，不會把 Push 變成免費 Reply。
-    """
-    group_id = S.get("driver_group")
-    if not group_id:
-        return False, "尚未綁定司機群組"
+
+def driver_group_reply(event, text=None, allow_passive=True):
+    """使用司機群組當前事件的 Reply Token，合併待通知與自動刷單內容。"""
+    uid = event.source.user_id
+    now = time.time()
+    queue = S.setdefault("pending_notifications", [])
+    ready = [n for n in queue if not n.get("driver_user_id") or n.get("driver_user_id") == uid]
+
+    orders = active_orders()
+    first_due = []
+    for oid, order in orders:
+        if order.get("kind") != "dispatch":
+            continue
+        if "first_reply_after" not in order:
+            order["first_reply_after"] = now + 5
+            order["first_reply_sent"] = False
+        if not order.get("first_reply_sent") and now >= float(order.get("first_reply_after", now + 5)):
+            first_due.append((oid, order))
+
+    last_passive = float(S.get("last_passive_ts", 0) or 0)
+    # 新派單必須先等滿 5 秒；在首次刷單送出前，不可被「上次時間為 0」誤判成立即到期。
+    waiting_first = any(
+        order.get("kind") == "dispatch" and not order.get("first_reply_sent")
+        for _, order in orders
+    )
+    regular_refresh_due = (not waiting_first) and (now - last_passive >= RESEND_INTERVAL)
+    passive_due = bool(allow_passive and orders and (first_due or regular_refresh_due))
+
+    messages = []
+    if text:
+        messages.append(str(text))
+    if ready:
+        for item in ready:
+            messages.append(item.get("text", "📣 有一筆派單通知，請查看。"))
+    if passive_due:
+        body = "\n──────\n".join(f"#{oid} {o.get('content','')}" for oid, o in orders)
+        heading = "🔄 自動刷單｜首次更新" if first_due else "🔄 自動刷單｜訂單更新"
+        messages.append(f"{heading}\n{body}\n\n以上為目前有效訂單；新訂單及狀態變更會在後續刷單更新。")
+
+    if not messages:
+        return
+
+    # 一次 Reply Token 只送一次；若只有一筆引用通知，保留原喊單 quoteToken。
+    quote_token = ready[0].get("quote_token") if len(ready) == 1 else None
+    body = "\n\n────────────\n\n".join(messages)
     try:
-        message = TextMessage(text=str(text)[:4900], quote_token=quote_token) if quote_token else TextMessage(text=str(text)[:4900])
+        msg = TextMessage(text=body[:4900], quote_token=quote_token) if quote_token else TextMessage(text=body[:4900])
         with ApiClient(config) as c:
-            MessagingApi(c).push_message(
-                PushMessageRequest(to=group_id, messages=[message])
-            )
-        return True, None
+            MessagingApi(c).reply_message(
+                ReplyMessageRequest(reply_token=event.reply_token, messages=[msg]))
     except Exception as e:
         STATS["last_err"] = f"{now_tw()} {err_text(e)}"
-        print("driver group push failed:", err_text(e), flush=True)
-        return False, err_text(e)
+        print("driver group reply failed:", err_text(e), flush=True)
+        return
 
-
-def push_result_text(ok, error=None):
-    if ok:
-        return "✅ 已同步通知司機群組。"
-    return f"⚠️ 訊息已記錄，但司機群組通知失敗：{error or '未知錯誤'}"
+    if ready:
+        ready_ids = {n.get("id") for n in ready}
+        S["pending_notifications"] = [n for n in queue if n.get("id") not in ready_ids]
+    if passive_due:
+        for _, order in first_due:
+            order["first_reply_sent"] = True
+            order["first_reply_sent_at"] = now
+        S["last_passive_ts"] = now
+        STATS["passive"] += 1
+    if ready or passive_due:
+        save()
 
 
 def is_admin(user_id):
@@ -243,8 +300,10 @@ def record_shout(event, group_id, user_id, content):
         "updated_at": now_tw()
     }
     save()
-    return reply(event.reply_token,
-                 f"✅ 喊單已記錄 #{oid}\n{name}：{content}\n\n派單員可在派單員群組輸入「喊單列表」查看。")
+    return driver_group_reply(
+        event,
+        f"✅ 喊單已記錄 #{oid}\n{name}：{content}\n\n派單員可在派單員群組輸入「喊單列表」查看。"
+    )
 
 
 # ---------------- Webhook ----------------
@@ -308,18 +367,17 @@ def on_driver_group(event, text, src):
     tok, uid = event.reply_token, src.user_id
 
     if text in ("使用說明", "幫助", "help"):
-        return reply(tok, DRIVER_HELP)
+        return driver_group_reply(event, DRIVER_HELP)
     if text in ("訂單列表", "可接訂單", "列表"):
-        return reply(tok, active_order_list())
+        return driver_group_reply(event, active_order_list())
     if text in ("查看回覆", "我的回覆", "派單員回覆"):
-        return reply(tok, "目前已改為即時群組通知，不需要再輸入「查看回覆」。派單員指定你或取消訂單時，通知會直接出現在司機群組。")
+        return driver_group_reply(event, "目前採用自動引用回覆，不需要輸入「查看回覆」。有待通知時，系統會在你於司機群組發言時自動回覆。")
     if text.startswith("喊單 ") or text.startswith("喊 ") or text.startswith("+1 "):
         content = re.sub(r"^(喊單|喊|\+1)\s+", "", text).strip()
         if not content:
-            return reply(tok, "格式：喊單 訂單內容／地點／時間")
+            return driver_group_reply(event, "格式：喊單 訂單內容／地點／時間")
         return record_shout(event, src.group_id, uid, content)
 
-    # 保留舊版「@機器人 內容」喊單方式。
     mentioned, rest = strip_self_mention(event.message)
     if mentioned and rest:
         return record_shout(event, src.group_id, uid, rest)
@@ -333,9 +391,10 @@ def on_driver_group(event, text, src):
                 o["updated_at"] = now_tw()
                 found += 1
         save()
-        return reply(tok, f"已取消你 {found} 筆待處理喊單。")
+        return driver_group_reply(event, f"已取消你 {found} 筆待處理喊單。")
 
-    return passive_remind(event)
+    # 一般訊息也可觸發待通知佇列與 5 秒／30 秒自動刷單。
+    return driver_group_reply(event)
 
 
 def on_dispatcher_group(event, text, src):
@@ -358,8 +417,8 @@ def on_dispatcher_group(event, text, src):
         return reply(tok, status_text())
     if cmd == "取消":
         result = cancel_all_orders()
-        ok, error = push_driver_group(f"🚫 CAR SPEED 公告：所有進行中的訂單已取消。\n{now_tw()}")
-        return reply(tok, result + "\n" + push_result_text(ok, error))
+        queue_driver_notification(f"🚫 CAR SPEED 公告：所有進行中的訂單已取消。\n{now_tw()}")
+        return reply(tok, result + "\n✅ 已加入司機群組待通知佇列；司機群組下一次有人發言時以 Reply 通知。")
 
     m = re.match(r"^派單\s+(.+)$", cmd, re.S)
     if m:
@@ -375,8 +434,8 @@ def on_dispatcher_group(event, text, src):
         }
         save()
         # 新派單不跨群組 Push：建立後 5 秒起，等司機群組下一次有人發言時
-        # 使用該事件的 Reply Token 做首次提醒；首次提醒後恢復每 30 秒被動 Reply。
-        return reply(tok, f"✅ 訂單已建立 #{oid}\n{content}\n\n新訂單首次提醒：建立 5 秒後，司機群組有人發言時以 Reply 顯示；之後每 {RESEND_INTERVAL} 秒被動提醒一次。")
+        # 使用該事件的 Reply Token 做首次自動刷單；首次刷單後恢復每 30 秒被動 Reply。
+        return reply(tok, f"✅ 訂單已建立 #{oid}\n{content}\n\n自動刷單：建立 5 秒後，司機群組有新訊息事件時首次 Reply 更新；之後每 {RESEND_INTERVAL} 秒，有新訊息事件時再 Reply 更新。")
 
     # @司機名稱 內容：將帶有司機標示的通知直接送到司機群組。
     # 這裡的 @ 是文字標示；司機不在派單員群組，不能在派單員群組原生 mention。
@@ -399,9 +458,10 @@ def on_dispatcher_group(event, text, src):
         shout["dispatcher_reply"] = message
         save()
         notice = f"📣 派單員回覆\n👤 司機：{driver_name}\n🔖 喊單編號：#{next((oid for oid, o in S['orders'].items() if o is shout), '')}\n📝 {message}\n🕒 {now_tw()}"
-        ok, error = push_driver_group(notice, quote_token=shout.get("quote_token"))
-        quote_note = "（已引用原始喊單）" if shout.get("quote_token") else "（原始訊息未提供 quoteToken，改以一般訊息通知）"
-        return reply(tok, f"{'✅' if ok else '⚠️'} 已回覆 {driver_name}{quote_note}\n{push_result_text(ok, error)}")
+        queue_driver_notification(notice, driver_user_id=driver_user_id, driver_name=driver_name,
+                                  quote_token=shout.get("quote_token"), order_id=next((oid for oid, o in S["orders"].items() if o is shout), None))
+        quote_note = "（司機下次發言時引用原始喊單回覆）" if shout.get("quote_token") else "（司機下次發言時以 Reply 通知）"
+        return reply(tok, f"✅ 已登記回覆 {driver_name}{quote_note}。\n不使用 Push；等待該司機在司機群組下一次發言時送出。")
 
     m = re.match(r"^回喊單\s+(\d+)\s+(.+)$", cmd, re.S)
     if m:
@@ -415,9 +475,10 @@ def on_dispatcher_group(event, text, src):
         order["dispatcher_reply"] = message
         save()
         notice = f"📣 喊單處理通知\n👤 司機：@{driver_name}\n🔖 喊單編號：#{oid}\n📝 派單員回覆：{message}\n🕒 時間：{now_tw()}"
-        ok, error = push_driver_group(notice, quote_token=order.get("quote_token"))
-        quote_note = "已引用原始喊單。" if order.get("quote_token") else "原始喊單沒有可用 quoteToken，已改為一般通知。"
-        return reply(tok, f"已處理喊單 #{oid}（{driver_name}）。\n{quote_note}\n{push_result_text(ok, error)}\n回覆內容：{message}")
+        queue_driver_notification(notice, driver_user_id=order.get("driver_user_id"), driver_name=driver_name,
+                                  quote_token=order.get("quote_token"), order_id=oid)
+        quote_note = "司機下次發言時引用原始喊單回覆。" if order.get("quote_token") else "司機下次發言時以 Reply 通知。"
+        return reply(tok, f"已處理喊單 #{oid}（{driver_name}）。\n{quote_note}\n已加入待通知佇列，不使用 Push。\n回覆內容：{message}")
 
     m = re.match(r"^完成喊單\s+(\d+)$", cmd)
     if m:
@@ -429,17 +490,20 @@ def on_dispatcher_group(event, text, src):
         order["updated_at"] = now_tw()
         save()
         driver_name = order.get("driver_name", "未知司機")
-        ok, error = push_driver_group(f"✅ 喊單已完成\n👤 司機：@{driver_name}\n🔖 喊單編號：#{oid}", quote_token=order.get("quote_token"))
-        return reply(tok, f"喊單 #{oid} 已標記完成。\n{push_result_text(ok, error)}")
+        queue_driver_notification(f"✅ 喊單已完成\n👤 司機：@{driver_name}\n🔖 喊單編號：#{oid}",
+                                  driver_user_id=order.get("driver_user_id"), driver_name=driver_name,
+                                  quote_token=order.get("quote_token"), order_id=oid)
+        return reply(tok, f"喊單 #{oid} 已標記完成，通知已排入佇列；司機下次在司機群組發言時收到。")
 
     m = re.match(r"^回司機\s+(.+?)\s+(.+)$", cmd, re.S)
     if m:
         driver_name, message = m.group(1).strip(), m.group(2).strip()
         if driver_name not in S.get("drivers", {}):
             return reply(tok, f"尚未記錄司機「{driver_name}」。請確認司機曾在司機群組發言或喊單。")
+        driver_user_id = S.get("drivers", {}).get(driver_name)
         notice = f"📣 派單員通知\n👤 指定司機：@{driver_name}\n📝 內容：{message}\n🕒 時間：{now_tw()}"
-        ok, error = push_driver_group(notice)
-        return reply(tok, f"已處理給 {driver_name} 的通知。\n{push_result_text(ok, error)}")
+        queue_driver_notification(notice, driver_user_id=driver_user_id, driver_name=driver_name)
+        return reply(tok, f"已將通知排入 {driver_name} 的待通知佇列；司機下次在司機群組發言時收到，不使用 Push。")
 
     m = re.match(r"^取消訂單\s+(\d+)$", cmd)
     if m:
@@ -451,52 +515,18 @@ def on_dispatcher_group(event, text, src):
         order["updated_at"] = now_tw()
         save()
         target = order.get("driver_name") or order.get("assigned_driver") or "相關司機"
-        ok, error = push_driver_group(f"🚫 訂單取消通知\n👤 對象：@{target}\n🔖 訂單編號：#{oid}\n📝 原訂單：{one_line(order.get('content', ''), 300)}", quote_token=order.get("quote_token"))
-        return reply(tok, f"已取消訂單 #{oid}。\n{push_result_text(ok, error)}")
+        queue_driver_notification(f"🚫 訂單取消通知\n👤 對象：@{target}\n🔖 訂單編號：#{oid}\n📝 原訂單：{one_line(order.get('content', ''), 300)}",
+                                  driver_user_id=order.get("driver_user_id"), driver_name=target,
+                                  quote_token=order.get("quote_token"), order_id=oid)
+        return reply(tok, f"已取消訂單 #{oid}。取消通知已排入佇列，不使用 Push；司機下次在司機群組發言時收到。")
 
     return reply(tok, DISPATCHER_HELP)
 
 
 # ---------------- 被動刷單：只在司機群組使用 Reply ----------------
 def passive_remind(event):
-    global LAST_PASSIVE
-    orders = active_orders()
-    if not orders:
-        return
-
-    now = time.time()
-    # 每筆新派單建立後 5 秒即可觸發首次提醒，但必須等司機群組有新訊息，
-    # 才有可用的 Reply Token。這不是定時主動 Push。
-    first_due = []
-    for oid, order in orders:
-        if order.get("kind") != "dispatch":
-            continue
-        if "first_reply_after" not in order:
-            # 舊版尚未設定首次提醒時間的進行中訂單，升級後給予 5 秒緩衝。
-            order["first_reply_after"] = now + 5
-            order["first_reply_sent"] = False
-        if not order.get("first_reply_sent") and now >= float(order.get("first_reply_after", now + 5)):
-            first_due.append((oid, order))
-
-    is_first_notice = bool(first_due)
-    if not is_first_notice and now - LAST_PASSIVE < RESEND_INTERVAL:
-        return
-
-    body = "\n──────\n".join(f"#{oid} {o.get('content','')}" for oid, o in orders)
-    heading = "📣 新派單首次提醒" if is_first_notice else "🔁 目前進行中的訂單"
-    try:
-        reply(event.reply_token, f"{heading}\n{body}\n\n輸入「訂單列表」可再次查看。")
-    except Exception as e:
-        print("passive remind failed:", err_text(e), flush=True)
-        return
-
-    if is_first_notice:
-        for _, order in first_due:
-            order["first_reply_sent"] = True
-            order["first_reply_sent_at"] = now
-        save()
-    LAST_PASSIVE = now
-    STATS["passive"] += 1
+    # 相容舊版呼叫：統一由 driver_group_reply 管理佇列與 5 秒／30 秒提醒。
+    return driver_group_reply(event)
 
 
 # ---------------- 私訊：管理員綁定 / 狀態 ----------------
@@ -531,9 +561,9 @@ def status_text():
         f"派單員群組：{'已綁定' if S.get('dispatcher_group') else '未綁定'}\n"
         f"待處理喊單：{len(pending_shouts())} 筆\n"
         f"進行中派單：{sum(1 for _,o in active_orders() if o.get('kind') == 'dispatch')} 筆\n"
-        f"跨群組引用回覆：{'可用（Push API；會計入訊息額度）' if S.get('driver_group') else '未設定'}\n"
-        f"新派單首次提醒：建立 5 秒後，司機群組有新訊息時 Reply\n"
-        f"後續被動提醒間隔：{RESEND_INTERVAL} 秒\n"
+        f"待通知佇列：{len(S.get('pending_notifications', []))} 筆（等待司機群組事件 Reply）\n"
+        f"自動刷單：建立 5 秒後首次事件 Reply；後續間隔 {RESEND_INTERVAL} 秒，需有群組新訊息事件\n"
+        f"後續自動刷單間隔：{RESEND_INTERVAL} 秒\n"
         f"服務運行：{int((time.time()-STATS['started'])//60)} 分鐘\n"
         f"最近錯誤：{STATS['last_err'] or '無'}"
     )
@@ -545,22 +575,22 @@ DRIVER_HELP = (
     "喊單 桃園機場 18:30 → 登記喊單\n"
     "訂單列表 → 查看目前可接訂單\n"
     "取消我的喊單 → 取消自己的待處理喊單\n"
-    "\n派單員指定司機、發布派單或取消訂單時，通知會直接出現在本司機群組，不需輸入查看回覆。"
+    "\n派單員指定司機、回覆或取消時，通知會先排入佇列；司機在本群組下一次發言時，機器人以 Reply 自動送出，不需輸入查看回覆。"
 )
 
 DISPATCHER_HELP = (
     "🧑‍💼 派單員群組指令（管理員）\n"
     "喊單列表 → 查看司機待處理喊單\n"
-    "回喊單 編號 回覆內容 → 回覆該喊單司機，並通知司機群組\n"
-    "@司機名稱 內容 → 引用該司機最新待處理喊單並回覆到司機群組\n"
+    "回喊單 編號 回覆內容 → 將回覆排入該司機通知佇列\n"
+    "@司機名稱 內容 → 引用該司機最新待處理喊單，排入通知佇列\n"
     "完成喊單 編號 → 完成喊單\n"
     "派單 訂單內容 → 建立可接訂單\n"
     "訂單列表 → 查看進行中訂單\n"
-    "回司機 司機名稱 內容 → 將指定訊息公告到司機群組\n"
+    "回司機 司機名稱 內容 → 將指定訊息排入該司機通知佇列\n"
     "取消訂單 編號 → 取消單筆訂單\n"
     "取消 → 取消全部進行中派單\n"
     "狀態 → 查看系統狀態\n"
-    "\n注意：引用原始喊單的跨群組回覆仍使用 LINE Push API，會計入訊息額度；quoteToken 只提供引用效果。新派單不主動 Push：建立 5 秒後，司機群組有人發言時以 Reply 發出首次提醒；之後依設定間隔（預設 30 秒）被動 Reply。沒有進行中訂單就不回覆。@司機名稱是文字指令，不是 LINE 原生 mention。"
+    "\n注意：派單員對司機的指定、回覆及取消通知會先存入待通知佇列，不使用 Push；指定司機需在司機群組下一次發言時，機器人才可使用該事件 Reply Token 回覆，並可引用原始喊單。自動刷單：新派單建立 5 秒後，司機群組有新訊息事件時首次 Reply 顯示最新有效訂單；之後每 30 秒（可由 RESEND_INTERVAL 設定），在司機群組有新訊息事件時 Reply 更新訂單列表。沒有有效訂單就不刷單。這是事件觸發式 Reply，不是背景定時 Push；若群組沒有人發言，機器人不會自行發訊息。@司機名稱是文字指令，不是 LINE 原生 mention。"
 )
 
 PRIVATE_HELP = (
