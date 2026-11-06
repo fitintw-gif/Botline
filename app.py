@@ -1,4 +1,4 @@
-import json, os, re, threading, time
+import json, os, re, threading, time, unicodedata
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -32,6 +32,12 @@ def save():
         json.dump(S, f, ensure_ascii=False, indent=2)
 
 S = load()
+# Render 免費版重啟/休眠後檔案會被清空；綁定資料可放環境變數，重啟後自動恢復
+if not S.get("admin") and os.environ.get("ADMIN_USER_ID"):
+    S["admin"] = os.environ["ADMIN_USER_ID"]
+if not S.get("group") and os.environ.get("GROUP_ID"):
+    S["group"] = os.environ["GROUP_ID"]
+print(f"startup: admin_bound={bool(S.get('admin'))} group_bound={bool(S.get('group'))}", flush=True)
 
 # ---------- LINE 工具 ----------
 def push(to, text):
@@ -124,6 +130,10 @@ def on_group(event, text, src):
             return reply(event.reply_token, "只有管理員可以綁定群組")
         S["group"] = src.group_id
         save()
+        push(S["admin"],
+             f"群組 ID：{src.group_id}\n"
+             "建議到 Render 的 Environment 新增變數 GROUP_ID（值填上面這串），"
+             "之後服務重啟或休眠後不用重新綁定。")
         return reply(event.reply_token, "✅ 已綁定為派單群組")
 
     if src.group_id != S["group"]:
@@ -160,7 +170,7 @@ HELP = (
     "指派 司機名 訂單關鍵字 → 指派並公告（標註該司機）\n"
     "取消 訂單關鍵字 → 取消訂單、停止重送\n"
     "列表 → 看未指派的單\n"
-    "（只有一張未指派的單時，關鍵字可省略）"
+    "（只有一張未指派的單時，關鍵字可省略；有多筆符合會請你回覆 1、1,3 或「全部」選擇）"
 )
 
 def parse_driver(rest):
@@ -175,22 +185,50 @@ def parse_driver(rest):
 def driver_target(name):
     return {"user_id": S["drivers"].get(name), "name": name}
 
+def norm(x):
+    """比對用：全形轉半形、去掉所有空白與換行、轉小寫（避免空格差異造成比對失敗）。"""
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", x)).lower()
+
+def one_line(content, n=60):
+    t = re.sub(r"\s+", " ", content).strip()
+    return t if len(t) <= n else t[:n - 16] + "…" + t[-15:]  # 保留結尾，因為相同開頭的單常常差在後面
+
 def open_orders(keyword=""):
     items = [(k, v) for k, v in S["orders"].items() if not v.get("assigned")]
-    kw = keyword.strip().lower()
+    kw = norm(keyword)
     if kw:
-        items = [(k, v) for k, v in items if kw in v["content"].lower()]
+        items = [(k, v) for k, v in items if kw in norm(v["content"])]
     return items
 
-def pick_order(keyword):
-    """回傳 (order_id, order, 錯誤訊息)。必須剛好符合一張。"""
-    items = open_orders(keyword)
-    if len(items) == 1:
-        return items[0][0], items[0][1], None
-    if not items:
-        return None, None, "找不到符合的未指派訂單（可用「列表」查看）"
-    rows = "\n".join("・" + v["content"][:30] for _, v in items)
-    return None, None, f"有 {len(items)} 筆符合，請用更明確的關鍵字：\n{rows}"
+# 多筆符合時，暫存管理員的選擇（只存在記憶體，不需要編號）
+PENDING = {}
+
+def ask_choose(action, name, items):
+    PENDING.clear()
+    PENDING.update(action=action, name=name, ids=[k for k, _ in items])
+    rows = "\n".join(f"{i}. {one_line(v['content'])}" for i, (_, v) in enumerate(items, 1))
+    return (f"有 {len(items)} 筆符合，請回覆要處理哪幾筆：\n{rows}\n\n"
+            "回覆「1」、「1,3」或「全部」（回其他內容＝取消這次選擇）")
+
+def do_assign(name, ids):
+    chosen = [S["orders"][i] for i in ids if i in S["orders"] and not S["orders"][i].get("assigned")]
+    if not chosen:
+        return "這些訂單已經不存在或已指派"
+    for o in chosen:
+        o["assigned"] = driver_target(name)
+    save()
+    body = "\n──────\n".join(o["content"] for o in chosen)
+    push_tagged(S["group"], f"✅ 指派給 {name}\n{body}", [driver_target(name)])
+    return f"✅ 已指派 {len(chosen)} 筆給 {name}，停止重送"
+
+def do_cancel(ids):
+    chosen = [S["orders"].pop(i) for i in ids if i in S["orders"]]
+    if not chosen:
+        return "這些訂單已經不存在"
+    save()
+    body = "\n──────\n".join(o["content"] for o in chosen)
+    push(S["group"], f"❌ 訂單已取消\n{body}")
+    return f"✅ 已取消 {len(chosen)} 筆，停止重送"
 
 def on_private(event, text, src):
     # 綁定管理員
@@ -198,13 +236,34 @@ def on_private(event, text, src):
         if text.replace("我是管理員", "").strip() == ADMIN_PASSWORD:
             S["admin"] = src.user_id
             save()
-            return reply(event.reply_token, "✅ 已綁定為管理員\n把我拉進司機群組後，在群組輸入「綁定群組」\n\n" + HELP)
+            return reply(event.reply_token,
+                         "✅ 已綁定為管理員\n"
+                         f"你的 ID：{src.user_id}\n"
+                         "建議到 Render 的 Environment 新增變數 ADMIN_USER_ID（值填上面這串），"
+                         "之後服務重啟或休眠後不用重新綁定。\n\n"
+                         "把我拉進司機群組後，在群組輸入「綁定群組」\n\n" + HELP)
         return reply(event.reply_token, "密碼錯誤")
 
     if src.user_id != S["admin"]:
         return reply(event.reply_token, "此機器人僅限管理員使用")
     if not S["group"]:
         return reply(event.reply_token, "尚未綁定群組：請把我拉進司機群組，並在群組輸入「綁定群組」")
+
+    # 上一則是「有多筆符合」的選擇題：回數字或「全部」就執行，其他內容視為放棄
+    if PENDING:
+        sel = text.strip()
+        if re.fullmatch(r"全部|\d+(?:[\s,，、]+\d+)*", sel):
+            ids = PENDING["ids"]
+            if sel != "全部":
+                picks = {int(n) for n in re.findall(r"\d+", sel)}
+                if any(n < 1 or n > len(ids) for n in picks):
+                    return reply(event.reply_token, f"請回覆 1 到 {len(ids)} 之間的數字，或「全部」")
+                ids = [ids[n - 1] for n in sorted(picks)]
+            action, name = PENDING["action"], PENDING.get("name")
+            PENDING.clear()
+            return reply(event.reply_token,
+                         do_assign(name, ids) if action == "assign" else do_cancel(ids))
+        PENDING.clear()
 
     if text.startswith("派單"):
         body = text[2:].strip()
@@ -215,6 +274,7 @@ def on_private(event, text, src):
         S["orders"][order_id] = {"content": body, "assigned": None,
                                  "last_sent": time.time(), "resend_count": 0}
         save()
+        print(f"dispatch: order={order_id}", flush=True)
         push(S["group"], f"📦 新訂單\n{body}\n\n要接請標註我並回：內容 時間")
         return reply(event.reply_token, "✅ 已發送")
 
@@ -230,35 +290,40 @@ def on_private(event, text, src):
         name, kw = parse_driver(text[2:])
         if not name:
             return reply(event.reply_token, "格式：指派 司機名 訂單關鍵字")
-        order_id, order, err = pick_order(kw)
-        if err:
-            return reply(event.reply_token, err)
-        order["assigned"] = driver_target(name)
-        save()
-        push_tagged(S["group"], f"✅ 指派給 {name}\n{order['content']}", [driver_target(name)])
-        return reply(event.reply_token, "✅ 已指派並公告，停止重送")
+        items = open_orders(kw)
+        if not items:
+            return reply(event.reply_token, "找不到符合的未指派訂單（可用「列表」查看）")
+        if len(items) > 1:
+            return reply(event.reply_token, ask_choose("assign", name, items))
+        return reply(event.reply_token, do_assign(name, [items[0][0]]))
 
     if text.startswith("取消"):
-        order_id, order, err = pick_order(text[2:])
-        if err:
-            return reply(event.reply_token, err)
-        S["orders"].pop(order_id, None)
-        save()
-        push(S["group"], f"❌ 訂單已取消\n{order['content']}")
-        return reply(event.reply_token, "✅ 已取消，停止重送")
+        items = open_orders(text[2:])
+        if not items:
+            return reply(event.reply_token, "找不到符合的未指派訂單（可用「列表」查看）")
+        if len(items) > 1:
+            return reply(event.reply_token, ask_choose("cancel", None, items))
+        return reply(event.reply_token, do_cancel([items[0][0]]))
 
     if text == "列表":
-        rows = [f"・{v['content'][:40]}" for _, v in open_orders()]
+        rows = [f"・{one_line(v['content'])}" for _, v in open_orders()]
         return reply(event.reply_token, "\n".join(rows) or "沒有未指派的單")
 
     reply(event.reply_token, HELP)
 
 # ---------- 自動重送 ----------
+_warned_unbound = False
+
 def resend_due():
     """未指派、未取消的訂單，距離上次發送滿 RESEND_INTERVAL 秒就重送到群組。
     取消（pop）或指派後就不再重送。"""
+    global _warned_unbound
     if not S["group"]:
+        if S["orders"] and not _warned_unbound:
+            print("resend skipped: group not bound", flush=True)
+            _warned_unbound = True
         return
+    _warned_unbound = False
     now = time.time()
     for order_id, o in list(S["orders"].items()):
         if o.get("assigned"):
