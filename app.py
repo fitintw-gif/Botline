@@ -395,7 +395,7 @@ def format_shout_content(content):
         "🐈‍⬛嘔吐需付清潔費5000",
         "🈲菸🈲檳榔",
     ])
-    return "\\n".join(card_lines)
+    return "\n".join(card_lines)
 
 
 def dispatcher_shout_list():
@@ -405,28 +405,29 @@ def dispatcher_shout_list():
         key = (order.get("driver_name", "未知司機"), order.get("source_group"))
         grouped.setdefault(key, []).append((oid, order))
 
+    if not grouped:
+        return "目前沒有待處理喊單。\\n輸入「清理全部」可清除所有待處理喊單。"
+
     for (driver_name, source_group), entries in grouped.items():
         source_group_name = (
             entries[0][1].get("source_group_name")
             or group_name(source_group)
         )
-        rows.append(f"👤 司機：{driver_name}")
-        rows.append(f"📍 來源群組：{source_group_name}")
         for index, (_, order) in enumerate(entries, 1):
-            rows.append(f"🚗 喊單 {index}")
-            rows.append(format_shout_content(order.get("content", "")))
-            if index < len(entries):
-                rows.append("────────────")
-        rows.append("━━━━━━━━━━━━")
-
-    if not grouped:
-        return "目前沒有待處理喊單。\n輸入「清理全部」可清除所有待處理喊單。"
+            rows.extend([
+                f"👤 內部司機：{driver_name}",
+                f"📍 來源群組：{source_group_name}",
+                f"📋 客人車卡（第 {index} 筆）",
+                "────────────",
+                format_shout_content(order.get("content", "")),
+                "━━━━━━━━━━━━",
+            ])
 
     rows.extend([
         "回覆格式：回 @司機名稱 內容",
         "清理全部 → 清除所有待處理喊單",
     ])
-    return "\n".join(rows)
+    return "\\n".join(rows)
 
 
 def active_order_list():
