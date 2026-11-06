@@ -326,88 +326,76 @@ def clear_all_pending_shouts():
 
 
 def format_shout_content(content):
-    """辨識車型、車號、車色、駕駛；清理空分隔符並保留其他有效資訊。"""
+    """將司機自由格式車卡資料辨識後，填入黑貓 CAR 固定車卡。"""
     aliases = {
-        "駕駛": "駕駛", "駕駛人": "駕駛", "司機姓名": "駕駛", "姓名": "駕駛",
-        "車型": "車型", "車款": "車型", "車種": "車型",
-        "車號": "車號", "車牌號碼": "車號", "車牌": "車號", "牌照": "車號",
-        "車色": "車色", "車身顏色": "車色", "顏色": "車色",
-        "特色": "特色", "備註": "特色", "服務": "特色",
+        "名字": "name", "姓名": "name", "駕駛": "name",
+        "駕駛姓名": "name", "駕駛人": "name", "司機姓名": "name",
+        "車款": "model", "車型": "model", "車種": "model",
+        "車號": "number", "車牌": "number", "車牌號碼": "number",
+        "牌照": "number",
+        "顏色": "color", "車色": "color", "車身顏色": "color",
     }
+    fields = {"name": "", "model": "", "number": "", "color": ""}
+    labels = sorted(aliases, key=len, reverse=True)
 
-    text = str(content or "")
-    text = text.replace("\u3000", " ")
+    text = str(content or "").replace("\u3000", " ")
+    # 以換行、逗號、分號及常見分隔符拆解；清除裝飾線。
     text = re.sub(r"[｜|]+", "\n", text)
     text = re.sub(r"[\r\n，,；;]+", "\n", text)
     text = re.sub(r"[━─—＿_]{2,}", "\n", text)
 
-    fields = {}
-    extras = []
-    known_labels = sorted(aliases, key=len, reverse=True)
-
-    for raw in text.split("\n"):
-        line = re.sub(r"\s+", " ", raw).strip(" ｜|：:；;，,。·•")
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    for raw_line in text.split("\n"):
+        line = re.sub(r"\s+", " ", raw_line).strip(" ：:；;，,。·•")
         if not line:
             continue
 
-        # 同一行若包含多個「欄位：內容」，先拆成多個欄位片段。
-        label_pattern = "|".join(re.escape(x) for x in known_labels)
+        # 支援同一行內連續出現多個「欄位：資料」。
         parts = re.split(
             rf"(?<!\S)({label_pattern})\s*[:：=＝]\s*",
             line
         )
         if len(parts) >= 3:
-            if parts[0].strip(" ：:"):
-                extras.append(parts[0].strip(" ：:"))
             for i in range(1, len(parts) - 1, 2):
-                label = parts[i]
+                key = aliases.get(parts[i])
                 value = parts[i + 1].strip(" ：:；;，,。·•")
-                canonical = aliases[label]
-                if value:
-                    fields[canonical] = (
-                        fields[canonical] + "、" + value
-                        if fields.get(canonical) else value
-                    )
+                if key and value and not fields[key]:
+                    fields[key] = value
             continue
 
-        matched = False
-        for alias in known_labels:
-            m = re.match(
-                rf"^{re.escape(alias)}\s*[:：=＝]\s*(.+)$",
+        for label in labels:
+            match = re.match(
+                rf"^{re.escape(label)}\s*[:：=＝]\s*(.+)$",
                 line
             )
-            if m:
-                value = m.group(1).strip(" ：:；;，,。·•")
-                if value:
-                    canonical = aliases[alias]
-                    fields[canonical] = (
-                        fields[canonical] + "、" + value
-                        if fields.get(canonical) else value
-                    )
-                matched = True
+            if match:
+                key = aliases[label]
+                value = match.group(1).strip(" ：:；;，,。·•")
+                if value and not fields[key]:
+                    fields[key] = value
                 break
-        if not matched:
-            extras.append(line)
 
-    # 清除多餘分隔符、重複內容及只有裝飾符號的殘留行。
-    cleaned_extras = []
-    seen = set()
-    for item in extras:
-        item = re.sub(r"[；;，,、｜|：:]+", " ", item)
-        item = re.sub(r"\s+", " ", item).strip(" -—_·•")
-        if not item or not re.search(r"[\w\u4e00-\u9fff]", item):
-            continue
-        if item not in seen:
-            cleaned_extras.append(item)
-            seen.add(item)
+    # 只輸出成功辨識的欄位；缺漏欄位直接省略，不顯示「未提供」。
+    card_lines = [
+        "🐈‍⬛黑貓 CAR🐈‍⬛",
+        "🐱認證司機🐱",
+    ]
+    for key, label in (
+        ("name", "名字"),
+        ("model", "車款"),
+        ("number", "車號"),
+        ("color", "顏色"),
+    ):
+        if fields[key]:
+            card_lines.append(f"{label}：{fields[key]}")
 
-    output = []
-    for label in ("車型", "車號", "車色", "駕駛", "特色"):
-        if fields.get(label):
-            output.append(f"{label}：{fields[label]}")
-    if cleaned_extras:
-        output.append("其他資訊：" + "、".join(cleaned_extras))
-    return "\n".join(output) if output else "（未提供喊單內容）"
+    card_lines.extend([
+        "——————————",
+        "🐈‍⬛未指定路線依導航",
+        "🐈‍⬛嘔吐需付清潔費5000",
+        "🈲菸🈲檳榔",
+    ])
+    return "\\n".join(card_lines)
 
 
 def dispatcher_shout_list():
