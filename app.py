@@ -278,12 +278,19 @@ def pending_shouts():
 
 def dispatcher_shout_list():
     rows = ["📥 司機待處理喊單", "────────────"]
-    for oid, o in pending_shouts():
-        rows.append(f"👤 {o.get('driver_name','未知司機')}｜{o.get('created_at','')}\\n{one_line(o.get('content',''), 160)}")
+    for _, order in pending_shouts():
+        rows.append(
+            f"👤 {order.get('driver_name', '未知司機')}｜{order.get('created_at', '')}\n"
+            f"{one_line(order.get('content', ''), 160)}"
+        )
     if len(rows) == 2:
         return "目前沒有待處理喊單。"
-    rows.append("────────────\\n回覆格式：回 @司機名稱 內容\\n完成格式：ok（僅有一筆待處理喊單時）")
-    return "\\n".join(rows)
+    rows.append(
+        "────────────\n"
+        "回覆格式：回 @司機名稱 內容\n"
+        "完成格式：ok（只有一筆待處理喊單時）；多筆請用 ok @司機名稱"
+    )
+    return "\n".join(rows)
 
 
 def active_order_list():
@@ -334,9 +341,9 @@ def record_shout(event, group_id, user_id, content):
         "updated_at": now_tw()
     }
     save()
-    # 司機喊單只寫入資料，不在司機群組回覆「喊單已記錄」，避免洗版。
-    # 派單員仍可在派單員群組輸入「喊單列表」查看。
-    return
+    # 司機喊單只入庫，不在司機群組顯示喊單紀錄或編號。
+    # 本次事件仍可觸發待通知回覆或到期的自動刷單。
+    return driver_group_reply(event)
 
 
 # ---------------- Webhook ----------------
@@ -470,50 +477,40 @@ def on_dispatcher_group(event, text, src):
         # 使用該事件的 Reply Token 做首次自動刷單；首次刷單後恢復每 30 秒被動 Reply。
         return reply(tok, f"✅ 訂單已建立 #{oid}\n{content}\n\n自動刷單：建立 5 秒後，司機群組有新訊息事件時首次 Reply 更新；之後每 {RESEND_INTERVAL} 秒，有新訊息事件時再 Reply 更新。")
 
-    # 回 @司機名稱 內容：派單員用簡短格式回覆指定司機最新待處理喊單。
-    m = re.match(r"^回\\s+[@＠]?(.+?)\\s+(.+)$", cmd, re.S)
-    if m:
-        driver_name, message = m.group(1).strip(), m.group(2).strip()
-        driver_user_id = S.get("drivers", {}).get(driver_name)
-        if not driver_user_id:
+    # 回 @司機名稱 內容：依已登記的完整 LINE 顯示名稱比對，支援名稱內含空格。
+    if cmd.startswith("回 "):
+        payload = cmd[2:].strip()
+        if payload.startswith(("@", "＠")):
+            payload = payload[1:].lstrip()
+        matched_name = next(
+            (name for name in sorted(S.get("drivers", {}).keys(), key=len, reverse=True)
+             if payload.startswith(name + " ")),
+            None
+        )
+        if not matched_name:
             known = "、".join(S.get("drivers", {}).keys()) or "尚無已記錄司機"
-            return reply(tok, f"找不到司機「{driver_name}」。\\n已記錄司機：{known}")
+            return reply(tok, f"找不到標示的司機，或名稱後缺少回覆內容。\n已記錄司機：{known}\n格式：回 @司機名稱 內容")
+        message = payload[len(matched_name):].strip()
+        if not message:
+            return reply(tok, "請輸入回覆內容。格式：回 @司機名稱 內容")
+        driver_user_id = S.get("drivers", {}).get(matched_name)
         shout = next((o for _, o in reversed(list(S["orders"].items()))
                       if o.get("kind") == "shout"
                       and o.get("status") == "pending"
                       and o.get("driver_user_id") == driver_user_id), None)
         if not shout:
-            return reply(tok, f"找不到 {driver_name} 尚待處理的喊單。請先輸入「喊單列表」確認。")
+            return reply(tok, f"找不到 {matched_name} 尚待處理的喊單。請先輸入「喊單列表」確認。")
         shout["status"] = "replied"
         shout["updated_at"] = now_tw()
         shout["dispatcher_reply"] = message
         save()
-        notice = f"派單員回覆：{message}"
-        queue_driver_notification(notice, driver_user_id=driver_user_id, driver_name=driver_name,
-                                  quote_token=shout.get("quote_token"))
-        return reply(tok, f"✅ 已登記回覆 {driver_name}。\\n司機下次在司機群組發言時，機器人會引用原喊單並原生標註司機回覆。")
-
-    # 相容舊格式 @司機名稱 內容。
-    m = re.match(r"^[@＠](.+?)\\s+(.+)$", cmd, re.S)
-    if m:
-        driver_name, message = m.group(1).strip(), m.group(2).strip()
-        driver_user_id = S.get("drivers", {}).get(driver_name)
-        if not driver_user_id:
-            known = "、".join(S.get("drivers", {}).keys()) or "尚無已記錄司機"
-            return reply(tok, f"找不到司機「{driver_name}」。\\n已記錄司機：{known}")
-        shout = next((o for _, o in reversed(list(S["orders"].items()))
-                      if o.get("kind") == "shout"
-                      and o.get("status") == "pending"
-                      and o.get("driver_user_id") == driver_user_id), None)
-        if not shout:
-            return reply(tok, f"找不到 {driver_name} 尚待處理的喊單。")
-        shout["status"] = "replied"
-        shout["updated_at"] = now_tw()
-        shout["dispatcher_reply"] = message
-        save()
-        queue_driver_notification(f"派單員回覆：{message}", driver_user_id=driver_user_id,
-                                  driver_name=driver_name, quote_token=shout.get("quote_token"))
-        return reply(tok, f"✅ 已登記回覆 {driver_name}，等待司機群組下一次訊息事件 Reply。")
+        queue_driver_notification(
+            f"派單員回覆：{message}",
+            driver_user_id=driver_user_id,
+            driver_name=matched_name,
+            quote_token=shout.get("quote_token")
+        )
+        return reply(tok, f"✅ 已登記回覆 {matched_name}。\n司機下次在司機群組發言時，機器人會引用原喊單並原生標註司機回覆。")
 
     # ok：若只有一筆待處理喊單，直接標記完成；多筆時要求指定司機避免誤結案。
     if cmd.lower() == "ok":
@@ -525,7 +522,7 @@ def on_dispatcher_group(event, text, src):
             return reply(tok, f"目前有 {len(pending)} 筆待處理喊單，為避免完成錯誤，請輸入：ok @司機名稱\\n待處理司機：{names}")
         oid, order = pending[0]
     else:
-        m = re.match(r"^ok\\s+[@＠]?(.+)$", cmd, re.I)
+        m = re.match(r"^ok\s+[@＠]?(.+)$", cmd, re.I)
         if not m:
             m = None
         if m:
@@ -539,7 +536,7 @@ def on_dispatcher_group(event, text, src):
         else:
             oid = order = None
 
-    if cmd.lower() == "ok" or re.match(r"^ok\\s+[@＠]?.+$", cmd, re.I):
+    if cmd.lower() == "ok" or re.match(r"^ok\s+[@＠]?.+$", cmd, re.I):
         order["status"] = "completed"
         order["updated_at"] = now_tw()
         save()
@@ -632,16 +629,16 @@ DRIVER_HELP = (
 )
 
 DISPATCHER_HELP = (
-    "🧑‍💼 派單員群組指令（管理員）\\n"
-    "喊單列表 → 查看司機待處理喊單（不顯示編號）\\n"
-    "回 @司機名稱 內容 → 回覆該司機最新待處理喊單\\n"
-    "ok → 完成唯一一筆待處理喊單；若有多筆，使用 ok @司機名稱\\n"
-    "派單 訂單內容 → 建立可接訂單\\n"
-    "訂單列表 → 查看進行中訂單\\n"
-    "取消訂單 編號 → 取消單筆訂單\\n"
-    "取消 → 取消全部進行中派單\\n"
-    "狀態 → 查看系統狀態\\n"
-    "\\n司機回覆及完成通知會排入佇列；司機群組有新訊息時，機器人使用 Reply 引用原喊單並原生標註司機。"
+    "🧑‍💼 派單員群組指令（管理員）\n"
+    "喊單列表 → 查看司機待處理喊單（不顯示喊單編號）\n"
+    "回 @司機名稱 內容 → 回覆該司機最新待處理喊單\n"
+    "ok → 完成唯一一筆待處理喊單；多筆時使用 ok @司機名稱\n"
+    "派單 訂單內容 → 建立可接訂單\n"
+    "訂單列表 → 查看進行中訂單\n"
+    "取消訂單 編號 → 取消單筆訂單\n"
+    "取消 → 取消全部進行中派單\n"
+    "狀態 → 查看系統狀態\n"
+    "\n司機喊單不在司機群組顯示確認訊息；派單員回覆與完成通知會排入佇列，待司機群組出現新訊息時以 Reply 引用原喊單並標註司機。"
 )
 
 PRIVATE_HELP = (
