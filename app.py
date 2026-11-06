@@ -406,7 +406,7 @@ def dispatcher_shout_list():
         grouped.setdefault(key, []).append((oid, order))
 
     if not grouped:
-        return "目前沒有待處理喊單。\\n輸入「清理全部」可清除所有待處理喊單。"
+        return "目前沒有待處理喊單。\n輸入「清理全部」可清除所有待處理喊單。"
 
     for (driver_name, source_group), entries in grouped.items():
         source_group_name = (
@@ -427,7 +427,7 @@ def dispatcher_shout_list():
         "回覆格式：回 @司機名稱 內容",
         "清理全部 → 清除所有待處理喊單",
     ])
-    return "\\n".join(rows)
+    return "\n".join(rows)
 
 
 def active_order_list():
