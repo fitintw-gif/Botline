@@ -302,18 +302,44 @@ def pending_shouts():
             if o.get("kind") == "shout" and o.get("status") == "pending"]
 
 
+def group_name(group_id):
+    """透過 LINE 群組摘要取得群組名稱；無法取得時使用預設名稱。"""
+    if not group_id:
+        return "司機群組"
+    try:
+        with ApiClient(config) as c:
+            summary = MessagingApi(c).get_group_summary(group_id)
+        return getattr(summary, "group_name", None) or "司機群組"
+    except Exception as e:
+        print("get group summary failed:", err_text(e), flush=True)
+        return "司機群組"
+
+
+def clear_all_pending_shouts():
+    count = 0
+    for _, order in pending_shouts():
+        order["status"] = "cleared"
+        order["updated_at"] = now_tw()
+        count += 1
+    save()
+    return f"✅ 已清理 {count} 筆待處理喊單。" if count else "目前沒有待處理喊單。"
+
+
 def dispatcher_shout_list():
     rows = ["📥 司機待處理喊單", "────────────"]
     for _, order in pending_shouts():
+        source_group = order.get("source_group")
+        source_group_name = order.get("source_group_name") or group_name(source_group)
         rows.append(
-            f"👤 {order.get('driver_name', '未知司機')}｜{order.get('created_at', '')}\n"
+            f"👤 {order.get('driver_name', '未知司機')}｜群組：{source_group_name}\n"
             f"{one_line(order.get('content', ''), 160)}"
         )
     if len(rows) == 2:
-        return "目前沒有待處理喊單。"
+        return "目前沒有待處理喊單。\n輸入「清理全部」可清除所有待處理喊單。"
     rows.append(
         "────────────\n"
         "回覆格式：回 @司機名稱 內容\n"
+        "清理全部 → 清除所有待處理喊單"
     )
     return "\n".join(rows)
 
@@ -465,6 +491,8 @@ def on_dispatcher_group(event, text, src):
         return reply(tok, DISPATCHER_HELP)
     if cmd in ("喊單列表", "待處理喊單", "喊單"):
         return reply(tok, dispatcher_shout_list())
+    if cmd == "清理全部":
+        return reply(tok, clear_all_pending_shouts())
     if cmd in ("訂單列表", "列表", "可接訂單"):
         return reply(tok, active_order_list())
     if cmd == "狀態":
@@ -598,7 +626,8 @@ DRIVER_HELP = (
 DISPATCHER_HELP = (
     "🧑‍💼 CAR SPEED｜派單員群組指令\\n"
     "【一、喊單處理】\\n"
-    "喊單列表 → 查看司機待處理喊單\\n"
+    "喊單列表 → 查看司機待處理喊單（顯示來源群組名稱）\\n"
+    "清理全部 → 清除所有待處理喊單\\n"
     "回 @司機名稱 內容 → 引用該司機最新喊單並回覆\\n"
     "\\n【二、派單管理】\\n"
     "派單 訂單內容 → 新增可接訂單\\n"
