@@ -184,20 +184,24 @@ def driver_group_reply(event, text=None, allow_passive=True):
     ]
 
     orders = active_orders()
+    # 首次推播狀態必須「逐群組」記錄，不能由 A 群的成功回覆替 B 群標記完成。
     first_due = []
     for oid, order in orders:
         if order.get("kind") != "dispatch":
             continue
         if "first_reply_after" not in order:
             order["first_reply_after"] = now + 5
-            order["first_reply_sent"] = False
-        if (not order.get("first_reply_sent")
+        sent_groups = order.setdefault("first_reply_sent_groups", [])
+        if (current_group_id not in sent_groups
                 and now >= float(order.get("first_reply_after", now + 5))):
             first_due.append((oid, order))
 
-    last_passive = float(S.get("last_passive_ts", 0) or 0)
+    # 後續 30 秒計時同樣逐群組保存，A 群更新不會重設 B 群的計時。
+    last_by_group = S.setdefault("last_passive_ts_by_group", {})
+    last_passive = float(last_by_group.get(current_group_id, 0) or 0)
     waiting_first = any(
-        order.get("kind") == "dispatch" and not order.get("first_reply_sent")
+        order.get("kind") == "dispatch"
+        and current_group_id not in order.get("first_reply_sent_groups", [])
         for _, order in orders
     )
     regular_refresh_due = (
@@ -288,8 +292,12 @@ def driver_group_reply(event, text=None, allow_passive=True):
     if passive_due and any(isinstance(msg, TextMessage) and "自動刷單" in (msg.text or "")
                            for msg in messages):
         for _, order in first_due:
-            order["first_reply_sent"] = True
-            order["first_reply_sent_at"] = now
+            sent_groups = order.setdefault("first_reply_sent_groups", [])
+            if current_group_id not in sent_groups:
+                sent_groups.append(current_group_id)
+            order.setdefault("first_reply_sent_at_by_group", {})[current_group_id] = now
+        last_by_group[current_group_id] = now
+        # 舊欄位僅保留供舊版狀態檢視相容，不再用來判斷其他群組是否已收到。
         S["last_passive_ts"] = now
         STATS["passive"] += 1
 
@@ -927,8 +935,8 @@ def status_text():
         f"待處理喊單：{len(pending_shouts())} 筆\n"
         f"進行中派單：{sum(1 for _,o in active_orders() if o.get('kind') == 'dispatch')} 筆\n"
         f"待通知佇列：{len(S.get('pending_notifications', []))} 筆（等待司機群組事件 Reply）\n"
-        f"自動刷單：建立 5 秒後首次事件 Reply；後續間隔 {RESEND_INTERVAL} 秒，需有群組新訊息事件\n"
-        f"後續自動刷單間隔：{RESEND_INTERVAL} 秒\n"
+        f"自動刷單：每個司機群組各自首次 5 秒事件 Reply；之後各自每 {RESEND_INTERVAL} 秒，需有該群新訊息事件\n"
+        f"後續自動刷單間隔：每個司機群組獨立計時 {RESEND_INTERVAL} 秒\n"
         f"服務運行：{int((time.time()-STATS['started'])//60)} 分鐘\n"
         f"最近錯誤：{STATS['last_err'] or '無'}"
     )
