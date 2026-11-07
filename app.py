@@ -5,7 +5,7 @@ import time
 import tempfile
 import uuid
 from datetime import datetime, timezone, timedelta
-from flask import Flask, request, abort
+from flask import Flask, request, abort, jsonify
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
@@ -565,6 +565,110 @@ def callback():
 @app.get("/")
 def health():
     return "CAR SPEED dual-group bot is running"
+
+
+# ---------------- LIFF / 網頁即時派單看板 ----------------
+# Render 環境變數 DASHBOARD_TOKEN 設定一組獨立看板密碼；
+# 看板網址格式：https://你的服務網址/dashboard?key=密碼
+DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "").strip()
+
+DASHBOARD_HTML = r"""<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#102b36">
+<title>CAR SPEED｜派單即時看板</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f2f5f6;color:#203238;font-family:-apple-system,BlinkMacSystemFont,"Noto Sans TC",sans-serif}
+.app{max-width:760px;margin:auto;padding:14px}header{background:linear-gradient(135deg,#102b36,#245363);color:white;padding:21px;border-radius:19px}
+.brand{font-weight:800}.brand b{display:inline-grid;place-items:center;background:white;color:#173b47;border-radius:10px;width:36px;height:36px;margin-right:8px}
+h1{font-size:24px;margin:17px 0 5px}.sub{font-size:12px;color:#c8dce1}.live{display:inline-block;background:#d9f8e7;color:#12643b;border-radius:30px;padding:6px 10px;font-size:12px;font-weight:bold;margin-top:15px}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin:14px 0}.stat,.card{background:white;border:1px solid #e3eaec;border-radius:15px;padding:14px}
+.num{font-size:26px;font-weight:800}.stat small{display:block;color:#728187}.bar{display:flex;justify-content:space-between;align-items:center;margin:20px 2px 10px;gap:8px}
+h2{font-size:17px;margin:0}.filters{display:flex;gap:7px;margin-bottom:10px;flex-wrap:wrap}
+button{border:1px solid #d8e1e4;background:white;color:#40575e;border-radius:24px;padding:8px 12px;font-size:12px}
+button.active{background:#173e4a;color:white}.pill{font-size:11px;padding:6px 9px;border-radius:20px;font-weight:bold;white-space:nowrap}
+.yes{background:#dcf8e8;color:#137044}.wait{background:#fff1d8;color:#94600b}.info{font-size:13px;line-height:1.9;margin-top:11px;color:#40545a}
+.card{margin:10px 0}.head{display:flex;justify-content:space-between;align-items:center;gap:8px}.muted{color:#78878c}
+.driver{font-weight:bold;margin:8px 0}.empty{background:white;border-radius:14px;padding:18px;text-align:center;color:#78878c;font-size:13px}
+.foot{text-align:center;color:#89969a;font-size:11px;padding:22px 0}
+@media(max-width:400px){.app{padding:10px}.stat{padding:10px}.num{font-size:23px}}
+</style></head><body><main class="app">
+<header><div class="brand"><b>🚘</b> CAR SPEED</div><h1>派單即時看板</h1>
+<div class="sub">司機喊單與回覆同步｜派單人員專用</div><span class="live" id="live">● 正在連線</span>
+<div class="sub" id="updated" style="margin-top:9px">資料載入中…</div></header>
+<section class="stats">
+<div class="stat"><div class="num" id="dispatchCount">—</div><small>進行中派單</small></div>
+<div class="stat"><div class="num" style="color:#159653" id="replyCount">—</div><small>司機已回覆</small></div>
+<div class="stat"><div class="num" id="pendingCount">—</div><small>待處理喊單</small></div>
+</section>
+<div class="bar"><h2>司機回覆</h2></div>
+<div class="filters"><button class="active" data-filter="all">全部</button><button data-filter="replied">已回覆</button><button data-filter="pending">待處理</button></div>
+<div id="replies"><div class="empty">正在載入資料…</div></div>
+<div class="bar"><h2>目前進行中的派單</h2></div><div id="dispatches"><div class="empty">正在載入資料…</div></div>
+<div class="foot">CAR SPEED｜頁面每 5 秒自動同步<br>資料僅供已取得看板連結的人員查看</div>
+</main><script>
+const key=new URLSearchParams(location.search).get("key")||"";let filter="all";
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+function cardReply(x){const done=x.status==="replied";return `<article class="card"><div class="head"><b>${esc(x.driver_name||"未知司機")}</b><span class="pill ${done?"yes":"wait"}">${done?"✓ 已回覆":"◷ 待處理"}</span></div><div class="info"><div class="muted">來源群組：${esc(x.source_group_name||"司機群組")}　${esc(x.created_at||"")}</div><div style="margin-top:8px"><b>司機回覆原文：</b><br>${esc(x.content||"（無內容）").replace(/\n/g,"<br>")}</div>${x.fields?`<div style="margin-top:8px">🔎 自動辨識<br>${Object.entries(x.fields).filter(([k,v])=>v).map(([k,v])=>`${esc(k)}：<b>${esc(v)}</b>`).join("<br>")}</div>`:""}</div></article>`}
+function render(data){
+ document.getElementById("dispatchCount").textContent=data.dispatches.length;
+ document.getElementById("replyCount").textContent=data.shouts.filter(x=>x.status==="replied").length;
+ document.getElementById("pendingCount").textContent=data.shouts.filter(x=>x.status==="pending").length;
+ const list=data.shouts.filter(x=>filter==="all"||(filter==="replied"?x.status==="replied":x.status==="pending"));
+ document.getElementById("replies").innerHTML=list.length?list.map(cardReply).join(""):'<div class="empty">目前沒有符合條件的司機回覆</div>';
+ document.getElementById("dispatches").innerHTML=data.dispatches.length?data.dispatches.map(x=>`<article class="card"><div class="head"><b>派單 ${esc(x.id)}</b><span class="pill wait">進行中</span></div><div class="info">${esc(x.content).replace(/\n/g,"<br>")}<div class="muted" style="margin-top:7px">${esc(x.created_at||"")}</div></div></article>`).join(""):'<div class="empty">目前沒有進行中的派單</div>';
+ document.getElementById("updated").textContent="最後同步："+new Date().toLocaleTimeString("zh-TW",{hour12:false});
+ document.getElementById("live").textContent="● 即時同步中";
+}
+async function refresh(){try{const r=await fetch("/api/dashboard?key="+encodeURIComponent(key),{cache:"no-store"});if(!r.ok)throw new Error(r.status===403?"看板密碼錯誤或未設定":"連線失敗（"+r.status+"）");render(await r.json())}catch(e){document.getElementById("live").textContent="● "+e.message;document.getElementById("live").style.background="#ffe5e5";document.getElementById("live").style.color="#9b2929"}}
+document.querySelectorAll("[data-filter]").forEach(b=>b.addEventListener("click",()=>{filter=b.dataset.filter;document.querySelectorAll("[data-filter]").forEach(x=>x.classList.toggle("active",x===b));refresh()}));
+refresh();setInterval(refresh,5000);
+</script></body></html>"""
+
+
+def dashboard_authorized():
+    return bool(DASHBOARD_TOKEN and request.args.get("key", "") == DASHBOARD_TOKEN)
+
+
+@app.get("/dashboard")
+def dashboard_page():
+    if not DASHBOARD_TOKEN:
+        return "請先在 Render 設定 DASHBOARD_TOKEN 環境變數。", 503
+    if not dashboard_authorized():
+        abort(403)
+    return DASHBOARD_HTML
+
+
+@app.get("/api/dashboard")
+def dashboard_data():
+    if not dashboard_authorized():
+        abort(403)
+
+    dispatches = []
+    shouts = []
+    for oid, order in S.get("orders", {}).items():
+        kind = order.get("kind")
+        if kind == "dispatch" and order.get("status", "active") == "active":
+            dispatches.append({
+                "id": str(oid),
+                "content": str(order.get("content", "")),
+                "created_at": order.get("created_at", ""),
+            })
+        elif kind == "shout" and order.get("status") in ("pending", "replied"):
+            raw = str(order.get("content", ""))
+            shouts.append({
+                "driver_name": order.get("driver_name", "未知司機"),
+                "source_group_name": order.get("source_group_name") or "司機群組",
+                "content": raw,
+                "status": order.get("status"),
+                "created_at": order.get("created_at", ""),
+                "fields": extract_vehicle_fields(raw),
+            })
+
+    return jsonify({
+        "dispatches": dispatches[-100:],
+        "shouts": shouts[-200:],
+    })
 
 
 @handler.add(MessageEvent, message=TextMessageContent)
