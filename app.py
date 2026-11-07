@@ -39,7 +39,7 @@ config = Configuration(access_token=CHANNEL_TOKEN)
 def default_state():
     return {
         "admin": None, "admins": [],
-        "driver_group": None, "dispatcher_group": None,
+        "driver_group": None, "driver_groups": [], "dispatcher_group": None,
         "next_id": 1, "orders": {}, "drivers": {},
         "dispatcher_replies": [], "pending_notifications": [], "last_passive_ts": 0.0, "seen_message_ids": []
     }
@@ -63,10 +63,28 @@ def load():
     for key in ("orders", "drivers"):
         if not isinstance(data.get(key), dict):
             data[key] = {}
-    for key in ("admins", "dispatcher_replies", "pending_notifications", "seen_message_ids"):
+    for key in ("admins", "dispatcher_replies", "pending_notifications", "seen_message_ids", "driver_groups"):
         if not isinstance(data.get(key), list):
             data[key] = []
+    # 相容舊版單一 driver_group：升級時自動納入多群組清單，不遺失舊綁定。
+    legacy_driver_group = data.get("driver_group")
+    if legacy_driver_group and legacy_driver_group not in data["driver_groups"]:
+        data["driver_groups"].append(legacy_driver_group)
+    # 保留 driver_group 作為舊版相容欄位，實際判斷以 driver_groups 為準。
+    if data["driver_groups"] and not data.get("driver_group"):
+        data["driver_group"] = data["driver_groups"][0]
     return data
+
+
+def get_driver_groups():
+    """回傳所有已綁定司機群組，並兼容舊版單一群組欄位。"""
+    groups = S.get("driver_groups", [])
+    if not isinstance(groups, list):
+        groups = []
+    legacy = S.get("driver_group")
+    if legacy and legacy not in groups:
+        groups = groups + [legacy]
+    return groups
 
 
 S = load()
@@ -74,11 +92,18 @@ if not S.get("admin") and os.environ.get("ADMIN_USER_ID"):
     S["admin"] = os.environ["ADMIN_USER_ID"]
     if S["admin"] not in S["admins"]:
         S["admins"].append(S["admin"])
-if not S.get("driver_group") and os.environ.get("DRIVER_GROUP_ID"):
-    S["driver_group"] = os.environ["DRIVER_GROUP_ID"]
-# 相容舊環境變數 GROUP_ID：只作為司機群組，不會自動當派單員群組。
-if not S.get("driver_group") and os.environ.get("GROUP_ID"):
-    S["driver_group"] = os.environ["GROUP_ID"]
+# 可用 DRIVER_GROUP_IDS 設定多個司機群組 ID，以逗號分隔。
+for env_group_id in os.environ.get("DRIVER_GROUP_IDS", "").split(","):
+    env_group_id = env_group_id.strip()
+    if env_group_id and env_group_id not in S["driver_groups"]:
+        S["driver_groups"].append(env_group_id)
+# 相容舊環境變數：單一 ID 也會加入多群組清單。
+for env_name in ("DRIVER_GROUP_ID", "GROUP_ID"):
+    env_group_id = os.environ.get(env_name, "").strip()
+    if env_group_id and env_group_id not in S["driver_groups"]:
+        S["driver_groups"].append(env_group_id)
+if S["driver_groups"] and not S.get("driver_group"):
+    S["driver_group"] = S["driver_groups"][0]
 if not S.get("dispatcher_group") and os.environ.get("DISPATCHER_GROUP_ID"):
     S["dispatcher_group"] = os.environ["DISPATCHER_GROUP_ID"]
 
@@ -123,8 +148,9 @@ def reply(token, text):
             ReplyMessageRequest(reply_token=token, messages=[TextMessage(text=text)]))
 
 
-def queue_driver_notification(text, driver_user_id=None, driver_name=None, quote_token=None, order_id=None):
-    """只寫入待通知佇列；不呼叫 Push API，等待司機群組下一個可用 Reply Token。"""
+def queue_driver_notification(text, driver_user_id=None, driver_name=None,
+                              quote_token=None, order_id=None, target_group_id=None):
+    """排入指定來源司機群組的通知；不呼叫 Push API。"""
     item = {
         "id": uuid.uuid4().hex,
         "text": str(text),
@@ -132,6 +158,7 @@ def queue_driver_notification(text, driver_user_id=None, driver_name=None, quote
         "driver_name": driver_name,
         "quote_token": quote_token,
         "order_id": str(order_id) if order_id is not None else None,
+        "target_group_id": target_group_id,
         "created_at": now_tw(),
     }
     S.setdefault("pending_notifications", []).append(item)
@@ -144,12 +171,17 @@ def queue_driver_notification(text, driver_user_id=None, driver_name=None, quote
 def driver_group_reply(event, text=None, allow_passive=True):
     """以司機群組當前事件的 Reply Token，分開送出指定司機引用回覆及一般派單內容。"""
     uid = event.source.user_id
+    current_group_id = getattr(event.source, "group_id", None)
     now = time.time()
     queue = S.setdefault("pending_notifications", [])
 
-    # 只要司機群組有人發言，就處理所有已排隊通知；
-    # 引文引用原喊單，原生標註仍指向被回覆的目標司機，不要求本人發言。
-    ready = list(queue)
+    # 只處理「這個司機群組」的通知；舊版沒有 target_group_id 的佇列仍相容。
+    # 例如 A 群的喊單回覆，絕不會被 B 群的下一則訊息取走。
+    ready = [
+        item for item in queue
+        if not item.get("target_group_id")
+        or item.get("target_group_id") == current_group_id
+    ]
 
     orders = active_orders()
     first_due = []
@@ -695,9 +727,16 @@ def on_group(event, text, src):
     if text in ("綁定司機群組", "綁定群組"):
         if not is_admin(uid):
             return reply(tok, "⛔ 只有已授權管理員可以綁定司機群組。")
-        S["driver_group"] = gid
+        S.setdefault("driver_groups", [])
+        if gid not in S["driver_groups"]:
+            S["driver_groups"].append(gid)
+        if not S.get("driver_group"):
+            S["driver_group"] = gid
         save()
-        return reply(tok, "✅ 已由管理員綁定為【司機群組】。司機在此喊單，派單員到另一群組查看。")
+        return reply(
+            tok,
+            f"✅ 已加入【司機群組】綁定。\n目前共綁定 {len(get_driver_groups())} 個司機群組。\n此群組可正常喊單及接收系統通知。"
+        )
 
     if text == "綁定派單群組":
         if not is_admin(uid):
@@ -709,7 +748,7 @@ def on_group(event, text, src):
     # 僅接受已綁定的兩個群組，其餘群組完全不處理。
     if gid == S.get("dispatcher_group"):
         return on_dispatcher_group(event, text, src)
-    if gid == S.get("driver_group"):
+    if gid in get_driver_groups():
         return on_driver_group(event, text, src)
 
 
@@ -758,8 +797,14 @@ def on_dispatcher_group(event, text, src):
         return reply(tok, status_text())
     if cmd == "取消":
         result = cancel_all_orders()
-        queue_driver_notification("📢 CAR SPEED 公告：所有訂單已派出。")
-        return reply(tok, result + "\n✅ 已加入司機群組待通知佇列；司機群組下一次有人發言時以 Reply 通知。")
+        # 取消／公告屬於全體司機通知：每個已綁定司機群組各自排一份，
+        # 由該群組下一次訊息事件的 Reply Token 發送，不使用跨群 Push。
+        for target_group_id in get_driver_groups():
+            queue_driver_notification(
+                "🪧 B.B.C 聯合公告：所有訂單已派出。",
+                target_group_id=target_group_id,
+            )
+        return reply(tok, result + f"\n✅ 已分別加入 {len(get_driver_groups())} 個司機群組的待通知佇列；各群組下一次有人發言時以 Reply 通知。")
 
     m = re.match(r"^派單\s+(.+)$", cmd, re.S)
     if m:
@@ -809,7 +854,8 @@ def on_dispatcher_group(event, text, src):
             f"派單員回覆：{message}",
             driver_user_id=driver_user_id,
             driver_name=matched_name,
-            quote_token=shout.get("quote_token")
+            quote_token=shout.get("quote_token"),
+            target_group_id=shout.get("source_group")
         )
         return reply(tok, f"✅ 已登記回覆 {matched_name}。\n司機群組下次只要有人發言，機器人就會引用原喊單並原生標註 {matched_name} 回覆；不需要該司機本人發言。")
 
@@ -819,9 +865,25 @@ def on_dispatcher_group(event, text, src):
         if driver_name not in S.get("drivers", {}):
             return reply(tok, f"尚未記錄司機「{driver_name}」。請確認司機曾在司機群組發言或喊單。")
         driver_user_id = S.get("drivers", {}).get(driver_name)
-        notice = f"📣 派單員通知\n👤 指定司機：@{driver_name}\n📝 內容：{message}\n🕒 時間：{now_tw()}"
-        queue_driver_notification(notice, driver_user_id=driver_user_id, driver_name=driver_name)
-        return reply(tok, f"已將通知排入 {driver_name} 的待通知佇列；司機下次在司機群組發言時收到，不使用 Push。")
+        shout = next((o for _, o in reversed(list(S["orders"].items()))
+                      if o.get("kind") == "shout"
+                      and o.get("status") == "pending"
+                      and o.get("driver_user_id") == driver_user_id), None)
+        if not shout:
+            return reply(tok, f"找不到 {driver_name} 尚待處理的喊單。請先輸入「喊單列表」確認。")
+        shout["status"] = "replied"
+        shout["updated_at"] = now_tw()
+        shout["dispatcher_reply"] = message
+        save()
+        notice = f"派單員回覆：{message}"
+        queue_driver_notification(
+            notice,
+            driver_user_id=driver_user_id,
+            driver_name=driver_name,
+            quote_token=shout.get("quote_token"),
+            target_group_id=shout.get("source_group"),
+        )
+        return reply(tok, f"已將回覆排入 {driver_name} 原本喊單的司機群組；該群組下次有人發言時收到，不使用 Push。")
 
     return reply(tok, DISPATCHER_HELP)
 
@@ -860,7 +922,7 @@ def status_text():
         "📊 CAR SPEED 系統狀態\n"
         f"主管理員：{'已綁定' if S.get('admin') else '未綁定'}\n"
         f"管理員人數：{len(S.get('admins', []))}\n"
-        f"司機群組：{'已綁定' if S.get('driver_group') else '未綁定'}\n"
+        f"司機群組：{len(get_driver_groups())} 個已綁定\n"
         f"派單員群組：{'已綁定' if S.get('dispatcher_group') else '未綁定'}\n"
         f"待處理喊單：{len(pending_shouts())} 筆\n"
         f"進行中派單：{sum(1 for _,o in active_orders() if o.get('kind') == 'dispatch')} 筆\n"
@@ -904,7 +966,7 @@ PRIVATE_HELP = (
     "狀態 → 查看雙群組綁定及系統狀態\\n"
     "/help／幫助 → 查看管理員使用說明\\n"
     "\\n【群組綁定】（所有已授權管理員皆可）\\n"
-    "在司機群組輸入：綁定司機群組\\n"
+    "每個司機群組分別輸入：綁定司機群組（可重複綁定多個群組）\\n"
     "在派單員群組輸入：綁定派單群組\\n"
     "\\n【新增管理員】\\n"
     "私訊機器人輸入：我是管理員 密碼"
@@ -933,7 +995,8 @@ def strip_self_mention(message):
 if __name__ == "__main__":
     print("startup:", {
         "admin_bound": bool(S.get("admin")),
-        "driver_group_bound": bool(S.get("driver_group")),
+        "driver_group_bound": bool(get_driver_groups()),
+        "driver_group_count": len(get_driver_groups()),
         "dispatcher_group_bound": bool(S.get("dispatcher_group")),
     }, flush=True)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
