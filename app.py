@@ -584,6 +584,7 @@ def record_shout(event, group_id, user_id, content):
         "source_message_id": getattr(event.message, "id", None),
         "quote_token": getattr(event.message, "quote_token", None),
         "created_at": now_tw(), "source_group": group_id,
+        "source_group_name": group_name(group_id),
         "updated_at": now_tw()
     }
     save()
@@ -696,9 +697,19 @@ def dashboard_data():
             })
         elif kind == "shout" and order.get("status") in ("pending", "replied"):
             raw = str(order.get("content", ""))
+            # 看板與派單群「喊單列表」共用同一個來源群組名稱解析方式。
+            # 舊資料若尚未保存名稱，依 shout 記錄中的 source_group 查詢 LINE 群組摘要，
+            # 並寫回 state，避免看板每 5 秒重複呼叫 LINE API。
+            source_group_id = order.get("source_group")
+            source_group_name = order.get("source_group_name")
+            if not source_group_name and source_group_id:
+                source_group_name = group_name(source_group_id)
+                order["source_group_name"] = source_group_name
+                save()
             shouts.append({
                 "driver_name": order.get("driver_name", "未知司機"),
-                "source_group_name": order.get("source_group_name") or "司機群組",
+                "source_group_name": source_group_name or "群組名稱暫時無法取得",
+                "source_group_id": source_group_id,
                 "content": raw,
                 "status": order.get("status"),
                 "created_at": order.get("created_at", ""),
