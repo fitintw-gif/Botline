@@ -643,24 +643,46 @@ button.active{background:#173e4a;color:white}.pill{font-size:11px;padding:6px 9p
 <div class="stat"><div class="num" id="pendingCount">—</div><small>待處理喊單</small></div>
 </section>
 <div class="bar"><h2>司機回覆</h2></div>
-<div class="filters"><button class="active" data-filter="all">全部</button><button data-filter="replied">已回覆</button><button data-filter="pending">待處理</button></div>
+<div class="filters"><button class="active" data-filter="all">全部</button><button data-filter="replied">已回覆</button><button data-filter="pending">待處理</button><button data-filter="completed">已完成</button></div>
+<div class="bar" id="completedTools" style="display:none"><span class="muted" style="font-size:12px">已完成紀錄可保留；未保留者 14 天後自動刪除</span><button id="clearCompleted" style="background:#fff0f0;color:#a33;border-color:#f0cccc">全部清理</button></div>
 <div id="replies"><div class="empty">正在載入資料…</div></div>
 <div class="bar"><h2>目前進行中的派單</h2></div><div id="dispatches"><div class="empty">正在載入資料…</div></div>
 <div class="foot">CAR SPEED｜頁面每 5 秒自動同步<br>資料僅供已取得看板連結的人員查看</div>
 </main><script>
 const key=new URLSearchParams(location.search).get("key")||"";let filter="all";
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-function cardReply(x){const done=x.status==="replied";return `<article class="card"><div class="head"><b>${esc(x.driver_name||"未知司機")}</b><span class="pill ${done?"yes":"wait"}">${done?"✓ 已回覆":"◷ 待處理"}</span></div><div class="info"><div class="muted">來源群組：${esc(x.source_group_name||"司機群組")}　${esc(x.created_at||"")}</div><div style="margin-top:8px"><b>司機回覆原文：</b><br>${esc(x.content||"（無內容）").replace(/\n/g,"<br>")}</div>${x.fields?`<div style="margin-top:8px">🔎 自動辨識<br>${Object.entries(x.fields).filter(([k,v])=>v).map(([k,v])=>`${esc(k)}：<b>${esc(v)}</b>`).join("<br>")}</div>`:""}</div></article>`}
+function cardReply(x){
+ const done=x.status==="replied";
+ const badge=done?'<span class="pill yes">✓ 已完成</span>':'<span class="pill wait">◷ 待處理</span>';
+ const tools=done?`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:13px"><button data-retain="${esc(x.id)}" data-value="${x.retained?"false":"true"}">${x.retained?"★ 已保留（取消保留）":"☆ 保留紀錄"}</button><span class="muted" style="font-size:11px;align-self:center">${x.retained?"此紀錄不會自動刪除":"未保留：完成 14 天後自動刪除"}</span></div>`:"";
+ return `<article class="card"><div class="head"><b>${esc(x.driver_name||"未知司機")}</b>${badge}</div><div class="info"><div class="muted">來源群組：${esc(x.source_group_name||"司機群組")}　${esc(x.created_at||"")}</div><div style="margin-top:8px"><b>司機回覆原文：</b><br>${esc(x.content||"（無內容）").replace(/\\n/g,"<br>")}</div>${x.fields?`<div style="margin-top:8px">🔎 自動辨識<br>${Object.entries(x.fields).filter(([k,v])=>v).map(([k,v])=>`${esc(k)}：<b>${esc(v)}</b>`).join("<br>")}</div>`:""}${done?`<div class="muted" style="margin-top:8px">完成時間：${esc(x.completed_at||"")}</div>`:""}${tools}</div></article>`;
+}
 function render(data){
  document.getElementById("dispatchCount").textContent=data.dispatches.length;
  document.getElementById("replyCount").textContent=data.shouts.filter(x=>x.status==="replied").length;
  document.getElementById("pendingCount").textContent=data.shouts.filter(x=>x.status==="pending").length;
- const list=data.shouts.filter(x=>filter==="all"||(filter==="replied"?x.status==="replied":x.status==="pending"));
- document.getElementById("replies").innerHTML=list.length?list.map(cardReply).join(""):'<div class="empty">目前沒有符合條件的司機回覆</div>';
- document.getElementById("dispatches").innerHTML=data.dispatches.length?data.dispatches.map(x=>`<article class="card"><div class="head"><b>派單 ${esc(x.id)}</b><span class="pill wait">進行中</span></div><div class="info">${esc(x.content).replace(/\n/g,"<br>")}<div class="muted" style="margin-top:7px">${esc(x.created_at||"")}</div></div></article>`).join(""):'<div class="empty">目前沒有進行中的派單</div>';
+ const list=data.shouts.filter(x=>filter==="all"||(filter==="replied"&&x.status==="replied")||(filter==="pending"&&x.status==="pending")||(filter==="completed"&&x.status==="replied"));
+ document.getElementById("replies").innerHTML=list.length?list.map(cardReply).join(""):'<div class="empty">目前沒有符合條件的紀錄</div>';
+ document.getElementById("completedTools").style.display=filter==="completed"?"flex":"none";
+ document.getElementById("clearCompleted").disabled=!data.shouts.some(x=>x.status==="replied");
+ document.getElementById("dispatches").innerHTML=data.dispatches.length?data.dispatches.map(x=>`<article class="card"><div class="head"><b>派單 ${esc(x.id)}</b><span class="pill wait">進行中</span></div><div class="info">${esc(x.content).replace(/\\n/g,"<br>")}<div class="muted" style="margin-top:7px">${esc(x.created_at||"")}</div></div></article>`).join(""):'<div class="empty">目前沒有進行中的派單</div>';
  document.getElementById("updated").textContent="最後同步："+new Date().toLocaleTimeString("zh-TW",{hour12:false});
  document.getElementById("live").textContent="● 即時同步中";
 }
+async function postAction(url,payload){
+ const r=await fetch(url+"?key="+encodeURIComponent(key),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload||{})});
+ const result=await r.json().catch(()=>({}));
+ if(!r.ok||!result.ok)throw new Error(result.error||"操作失敗");
+ return result;
+}
+document.getElementById("replies").addEventListener("click",async e=>{
+ const b=e.target.closest("[data-retain]");if(!b)return;
+ try{await postAction("/api/dashboard/retain/"+encodeURIComponent(b.dataset.retain),{retained:b.dataset.value==="true"});await refresh()}catch(err){alert(err.message)}
+});
+document.getElementById("clearCompleted").addEventListener("click",async()=>{
+ if(!confirm("確定清理全部已完成紀錄？包含已保留的紀錄也會一併刪除，無法復原。"))return;
+ try{const r=await postAction("/api/dashboard/clear-completed",{});alert("已清理 "+r.deleted+" 筆完成紀錄。");await refresh()}catch(err){alert(err.message)}
+});
 async function refresh(){try{const r=await fetch("/api/dashboard?key="+encodeURIComponent(key),{cache:"no-store"});if(!r.ok)throw new Error(r.status===403?"看板密碼錯誤或未設定":"連線失敗（"+r.status+"）");render(await r.json())}catch(e){document.getElementById("live").textContent="● "+e.message;document.getElementById("live").style.background="#ffe5e5";document.getElementById("live").style.color="#9b2929"}}
 document.querySelectorAll("[data-filter]").forEach(b=>b.addEventListener("click",()=>{filter=b.dataset.filter;document.querySelectorAll("[data-filter]").forEach(x=>x.classList.toggle("active",x===b));refresh()}));
 refresh();setInterval(refresh,5000);
@@ -680,10 +702,79 @@ def dashboard_page():
     return DASHBOARD_HTML
 
 
+def cleanup_expired_completed_shouts():
+    """未保留的已完成喊單滿 14 天自動刪除；保留項目不自動刪除。"""
+    now = time.time()
+    cutoff = 14 * 24 * 60 * 60
+    orders = S.get("orders", {})
+    changed = False
+    deleted = 0
+
+    for oid, order in list(orders.items()):
+        if order.get("kind") != "shout" or order.get("status") != "replied":
+            continue
+        if order.get("retained", False):
+            continue
+
+        completed_ts = order.get("completed_at_ts")
+        if completed_ts is None:
+            stamp = order.get("updated_at") or order.get("created_at")
+            try:
+                completed_dt = datetime.strptime(stamp, "%Y/%m/%d %H:%M:%S").replace(
+                    tzinfo=timezone(timedelta(hours=8))
+                )
+                completed_ts = completed_dt.timestamp()
+            except Exception:
+                completed_ts = now
+            order["completed_at_ts"] = completed_ts
+            order.setdefault("completed_at", stamp or now_tw())
+            changed = True
+
+        if now - float(completed_ts) >= cutoff:
+            del orders[oid]
+            deleted += 1
+            changed = True
+
+    if changed:
+        save()
+    return deleted
+
+
+@app.post("/api/dashboard/retain/<order_id>")
+def dashboard_retain_shout(order_id):
+    if not dashboard_authorized():
+        abort(403)
+    order = S.get("orders", {}).get(str(order_id))
+    if not order or order.get("kind") != "shout" or order.get("status") != "replied":
+        return jsonify({"ok": False, "error": "找不到已完成喊單"}), 404
+    payload = request.get_json(silent=True) or {}
+    order["retained"] = bool(payload.get("retained", True))
+    order["retained_at"] = now_tw() if order["retained"] else None
+    save()
+    return jsonify({"ok": True, "retained": order["retained"]})
+
+
+@app.post("/api/dashboard/clear-completed")
+def dashboard_clear_completed():
+    if not dashboard_authorized():
+        abort(403)
+    orders = S.get("orders", {})
+    completed_ids = [
+        oid for oid, order in orders.items()
+        if order.get("kind") == "shout" and order.get("status") == "replied"
+    ]
+    for oid in completed_ids:
+        del orders[oid]
+    if completed_ids:
+        save()
+    return jsonify({"ok": True, "deleted": len(completed_ids)})
+
+
 @app.get("/api/dashboard")
 def dashboard_data():
     if not dashboard_authorized():
         abort(403)
+    cleanup_expired_completed_shouts()
 
     dispatches = []
     shouts = []
@@ -707,12 +798,15 @@ def dashboard_data():
                 order["source_group_name"] = source_group_name
                 save()
             shouts.append({
+                "id": str(oid),
                 "driver_name": order.get("driver_name", "未知司機"),
                 "source_group_name": source_group_name or "群組名稱暫時無法取得",
                 "source_group_id": source_group_id,
                 "content": raw,
                 "status": order.get("status"),
                 "created_at": order.get("created_at", ""),
+                "completed_at": order.get("completed_at", order.get("updated_at", "")),
+                "retained": bool(order.get("retained", False)),
                 "fields": extract_vehicle_fields(raw),
             })
 
@@ -867,6 +961,9 @@ def on_dispatcher_group(event, text, src):
             return reply(tok, f"找不到 {matched_name} 尚待處理的喊單。請先輸入「喊單列表」確認。")
         shout["status"] = "replied"
         shout["updated_at"] = now_tw()
+        shout["completed_at"] = now_tw()
+        shout["completed_at_ts"] = time.time()
+        shout.setdefault("retained", False)
         shout["dispatcher_reply"] = message
         save()
         queue_driver_notification(
@@ -892,6 +989,9 @@ def on_dispatcher_group(event, text, src):
             return reply(tok, f"找不到 {driver_name} 尚待處理的喊單。請先輸入「喊單列表」確認。")
         shout["status"] = "replied"
         shout["updated_at"] = now_tw()
+        shout["completed_at"] = now_tw()
+        shout["completed_at_ts"] = time.time()
+        shout.setdefault("retained", False)
         shout["dispatcher_reply"] = message
         save()
         notice = f"派單員回覆：{message}"
