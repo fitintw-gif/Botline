@@ -19,9 +19,10 @@ from linebot.v3.messaging.models import (
     TextMessageV2, MentionSubstitutionObject, UserMentionTarget,
 )
 from linebot.v3.webhooks import (MessageEvent, TextMessageContent, GroupSource, UserSource,
-                                 JoinEvent, MemberLeftEvent)
+                                 JoinEvent, MemberLeftEvent, LeaveEvent)
 
 # ============================================================
+# CAR SPEED v3.8.0｜LINE Login 管理後台雙向同步版
 # CAR SPEED 雙群組版
 # 司機群組：司機喊單、接收派單／指定司機／取消通知
 # 派單員群組：管理員查看喊單、發布訂單、指定司機及管理訂單
@@ -56,6 +57,7 @@ def default_state():
         "bootstrap_group_id": None, "bootstrap_candidate_user_id": None, "bootstrap_initialized": False,
         "pending_root_transfer": None, "permission_revocations": [],
         "driver_group": None, "driver_groups": [], "dispatcher_group": None,
+        "driver_group_records": [], "pending_driver_group_requests": [], "admin_audit_log": [], "member_directory": {},
         "next_id": 1, "orders": {}, "drivers": {},
         "dispatcher_replies": [], "pending_notifications": [], "last_passive_ts": 0.0, "seen_message_ids": []
     }
@@ -89,6 +91,16 @@ def load():
     # 保留 driver_group 作為舊版相容欄位，實際判斷以 driver_groups 為準。
     if data["driver_groups"] and not data.get("driver_group"):
         data["driver_group"] = data["driver_groups"][0]
+    for key in ("driver_group_records", "pending_driver_group_requests", "admin_audit_log"):
+        if not isinstance(data.get(key), list):
+            data[key] = []
+    if not isinstance(data.get("member_directory"), dict):
+        data["member_directory"] = {}
+    # 舊版已綁定群組自動遷移為 approved，絕不要求既有群組重新申請。
+    known = {x.get("group_id") for x in data["driver_group_records"] if isinstance(x, dict)}
+    for gid in data.get("driver_groups", []):
+        if gid and gid not in known:
+            data["driver_group_records"].append({"group_id": gid, "status": "approved", "group_name": "既有司機群組", "created_at": "既有綁定", "approved_at": "升級遷移", "source": "legacy_migration"})
     return data
 
 
@@ -101,6 +113,26 @@ def get_driver_groups():
     if legacy and legacy not in groups:
         groups = groups + [legacy]
     return groups
+
+
+def audit_admin(action, target_type, target_id, result="success", detail=""):
+    records = S.setdefault("admin_audit_log", [])
+    records.append({"actor_user_id": session.get("line_user_id") or "LINE群組操作", "action": action,
+                    "target_type": target_type, "target_id": str(target_id), "result": result,
+                    "detail": str(detail)[:300], "created_at": now_tw() if "now_tw" in globals() else datetime.now().strftime("%Y/%m/%d %H:%M:%S")})
+    S["admin_audit_log"] = records[-1000:]
+
+
+def group_record(group_id):
+    for item in S.setdefault("driver_group_records", []):
+        if isinstance(item, dict) and item.get("group_id") == group_id:
+            return item
+    return None
+
+
+def active_driver_groups():
+    return [x.get("group_id") for x in S.get("driver_group_records", [])
+            if isinstance(x, dict) and x.get("status") == "approved" and x.get("group_id")]
 
 
 S = load()
@@ -128,6 +160,11 @@ for env_name in ("DRIVER_GROUP_ID", "GROUP_ID"):
         S["driver_groups"].append(env_group_id)
 if S["driver_groups"] and not S.get("driver_group"):
     S["driver_group"] = S["driver_groups"][0]
+# 環境變數設定的既有群組也視為已核准，確保舊部署設定升級後不中斷。
+_known_group_records = {x.get("group_id") for x in S.get("driver_group_records", []) if isinstance(x, dict)}
+for _gid in S.get("driver_groups", []):
+    if _gid and _gid not in _known_group_records:
+        S.setdefault("driver_group_records", []).append({"group_id": _gid, "group_name": "既有司機群組", "status": "approved", "created_at": "既有綁定", "approved_at": "升級遷移", "source": "legacy_migration"})
 if not S.get("dispatcher_group") and os.environ.get("DISPATCHER_GROUP_ID"):
     S["dispatcher_group"] = os.environ["DISPATCHER_GROUP_ID"]
 
@@ -661,7 +698,7 @@ def callback():
 
 @app.get("/")
 def health():
-    return "CAR SPEED dual-group bot is running"
+    return "CAR SPEED v3.8.0 dual-group bot is running"
 
 
 # ---------------- LIFF / 網頁即時派單看板 ----------------
@@ -701,7 +738,11 @@ button.active{background:#173e4a;color:white}.pill{font-size:11px;padding:6px 9p
 <div class="bar" id="completedTools" style="display:none"><span class="muted" style="font-size:12px">已完成紀錄可保留；未保留者 14 天後自動刪除</span><button id="clearCompleted" style="background:#fff0f0;color:#a33;border-color:#f0cccc">全部清理</button></div>
 <div id="replies"><div class="empty">正在載入資料…</div></div>
 <div class="bar"><h2>目前進行中的派單</h2></div><div id="dispatches"><div class="empty">正在載入資料…</div></div>
-<section id="adminPanel" style="display:none;margin-top:20px"><div class="bar"><h2>最高管理員專區</h2></div><article class="card"><b>管理員身分已驗證</b><div class="info">此區僅最高管理員可見。群組申請審核等管理功能將在後續階段接入；目前不會改動既有群組綁定及權限資料。</div></article></section>
+<section id="adminPanel" style="display:none;margin-top:20px"><div class="bar"><h2>最高管理員專區</h2><span class="pill yes">身分已驗證</span></div>
+<div class="stats"><div class="stat"><div class="num" id="adminDispatcherCount">—</div><small>派單員</small></div><div class="stat"><div class="num" id="adminGroupCount">—</div><small>使用中群組</small></div><div class="stat"><div class="num" id="adminPendingCount">—</div><small>待審核群組</small></div></div>
+<article class="card"><div class="head"><b>派單員管理</b><span class="muted">以 LINE User ID 授權</span></div><div style="display:flex;gap:8px;margin-top:10px"><input id="dispatcherUid" placeholder="輸入已驗證的 LINE User ID" style="min-width:0;flex:1;padding:10px;border:1px solid #d8e1e4;border-radius:10px"><button id="assignDispatcher">指派</button><button id="revokeDispatcher">撤銷</button></div><div id="dispatcherList" class="info"></div></article>
+<article class="card"><div class="head"><b>司機群組管理</b><span class="muted">LINE／網頁共用資料</span></div><div id="groupList" class="info">載入中…</div></article>
+<article class="card"><b>最近管理操作紀錄</b><div id="adminAudit" class="info">載入中…</div></article></section>
 <div class="foot">CAR SPEED｜LINE 身分驗證｜頁面每 5 秒自動同步</div>
 </main><script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script><script>
 const LIFF_ID=__LIFF_ID_JSON__;let filter="all";let currentRole=null;
@@ -742,6 +783,12 @@ document.getElementById("clearCompleted").addEventListener("click",async()=>{
 });
 async function refresh(){const y=window.scrollY;try{const r=await fetch("/api/dashboard",{cache:"no-store",credentials:"same-origin"});if(!r.ok)throw new Error(r.status===403?"LINE 身分未授權或登入已失效":"連線失敗（"+r.status+"）");render(await r.json());window.scrollTo(0,y)}catch(e){document.getElementById("live").textContent="● "+e.message;document.getElementById("live").style.background="#ffe5e5";document.getElementById("live").style.color="#9b2929"}}
 document.querySelectorAll("[data-filter]").forEach(b=>b.addEventListener("click",()=>{filter=b.dataset.filter;document.querySelectorAll("[data-filter]").forEach(x=>x.classList.toggle("active",x===b));refresh()}));
+async function adminPost(path,payload){const r=await fetch(path,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});const x=await r.json().catch(()=>({}));if(!r.ok||!x.ok)throw new Error(x.error||"管理操作失敗");return x}
+async function loadAdmin(){if(currentRole!=="root_admin")return;const r=await fetch("/api/admin/overview",{cache:"no-store",credentials:"same-origin"});if(!r.ok)throw new Error("管理資料讀取失敗");const d=await r.json();document.getElementById("adminDispatcherCount").textContent=d.dispatchers.length;document.getElementById("adminGroupCount").textContent=d.groups.filter(x=>x.status==="approved").length;document.getElementById("adminPendingCount").textContent=d.pending_count;document.getElementById("dispatcherList").innerHTML=d.dispatchers.length?d.dispatchers.map(x=>`<div style="padding:7px 0;border-bottom:1px solid #edf0f1">${esc(x)}</div>`).join(""):"目前沒有派單員";const names={approved:"使用中",pending:"待審核",rejected:"已拒絕",unbound:"已解除綁定"};document.getElementById("groupList").innerHTML=d.groups.length?d.groups.map(g=>`<div style="padding:10px 0;border-bottom:1px solid #edf0f1"><b>${esc(g.group_name||"司機群組")}</b> <span class="pill ${g.status==="approved"?"yes":"wait"}">${names[g.status]||esc(g.status)}</span><div class="muted" style="font-size:10px;word-break:break-all">${esc(g.group_id)}</div>${g.status==="pending"?`<button data-group-action="approve" data-gid="${esc(g.group_id)}">核准</button> <button data-group-action="reject" data-gid="${esc(g.group_id)}">拒絕</button>`:g.status==="approved"?`<button data-group-action="unbind" data-gid="${esc(g.group_id)}">解除綁定</button>`:""}</div>`).join(""):"目前沒有群組紀錄";document.getElementById("adminAudit").innerHTML=d.audit.length?d.audit.map(a=>`<div style="padding:6px 0;border-bottom:1px solid #edf0f1">${esc(a.created_at)}｜${esc(a.action)}｜${esc(a.target_id)}｜${esc(a.result)}</div>`).join(""):"尚無管理操作紀錄"}
+document.getElementById("assignDispatcher").addEventListener("click",async()=>{const user_id=document.getElementById("dispatcherUid").value.trim();if(!user_id)return alert("請輸入 LINE User ID");if(!confirm("確定指派此 LINE User ID 為派單員？"))return;try{await adminPost("/api/admin/dispatcher",{action:"assign",user_id});alert("派單員指派成功");document.getElementById("dispatcherUid").value="";await loadAdmin()}catch(e){alert(e.message)}});
+document.getElementById("revokeDispatcher").addEventListener("click",async()=>{const user_id=document.getElementById("dispatcherUid").value.trim();if(!user_id)return alert("請輸入要撤銷的 LINE User ID");if(!confirm("確定撤銷此派單員的全系統權限？"))return;try{await adminPost("/api/admin/dispatcher",{action:"revoke",user_id});alert("派單員權限已撤銷");document.getElementById("dispatcherUid").value="";await loadAdmin()}catch(e){alert(e.message)}});
+document.getElementById("revokeDispatcher").addEventListener("click",async()=>{const user_id=document.getElementById("dispatcherUid").value.trim();if(!user_id)return alert("請輸入 LINE User ID");if(!confirm("確定撤銷此派單員權限？"))return;try{await adminPost("/api/admin/dispatcher",{action:"revoke",user_id});alert("派單員權限已撤銷");document.getElementById("dispatcherUid").value="";await loadAdmin()}catch(e){alert(e.message)}});
+document.getElementById("groupList").addEventListener("click",async e=>{const b=e.target.closest("[data-group-action]");if(!b)return;const action=b.dataset.groupAction,group_id=b.dataset.gid;if(!confirm("確定執行「"+action+"」？"))return;try{await adminPost("/api/admin/driver-group",{action,group_id});await loadAdmin()}catch(err){alert(err.message)}});
 async function startLiff(){
  try{
   if(!LIFF_ID)throw new Error("LIFF_ID 尚未設定，請聯絡系統管理員");
@@ -753,7 +800,8 @@ async function startLiff(){
   const result=await auth.json().catch(()=>({}));if(!auth.ok)throw new Error(result.error||"LINE 身分驗證失敗或尚未取得系統權限");
   currentRole=result.role;
   document.getElementById("adminPanel").style.display=currentRole==="root_admin"?"block":"none";
-  await refresh();setInterval(refresh,5000);
+  if(currentRole==="root_admin")await loadAdmin();
+  await refresh();setInterval(async()=>{await refresh();if(currentRole==="root_admin")await loadAdmin()},5000);
  }catch(e){document.getElementById("live").textContent="● "+e.message;document.getElementById("live").style.background="#ffe5e5";document.getElementById("live").style.color="#9b2929";}
 }
 startLiff();
@@ -1022,6 +1070,19 @@ def on_join(event):
         print("join handler error:", err_text(e), flush=True)
 
 
+@handler.add(LeaveEvent)
+def on_bot_leave(event):
+    """Bot 被移出司機群組時解除綁定；保留紀錄，重新加入不得自動恢復。"""
+    try:
+        src = event.source
+        if isinstance(src, GroupSource) and src.group_id in get_driver_groups():
+            unbind_driver_group(src.group_id, "bot_removed_from_driver_group", "LINE LeaveEvent")
+            print("driver group unbound after bot leave:", src.group_id, flush=True)
+    except Exception as e:
+        STATS["last_err"] = f"{now_tw()} bot leave: {err_text(e)}"
+        print("bot leave handler error:", err_text(e), flush=True)
+
+
 @handler.add(MemberLeftEvent)
 def on_member_left(event):
     """派單員離開任一已綁定派單群組，即撤銷全系統派單員權限。"""
@@ -1112,6 +1173,105 @@ def confirm_initial_root(uid, token):
     return reply(token, "✅ 最高管理員初始化完成。\n你已成為 CAR SPEED 唯一最高管理員。\n首次初始化入口已永久鎖定。\n請將機器人邀請至派單群組，再由你本人輸入「綁定派單群組」。")
 
 
+# ---------------- v3.8.0 群組申請與審核 ----------------
+def request_driver_group(event, src):
+    gid, uid = src.group_id, src.user_id
+    rec = group_record(gid)
+    if rec and rec.get("status") == "approved":
+        return reply(event.reply_token, "本群已是核准中的司機群組。")
+    if rec and rec.get("status") == "pending":
+        return reply(event.reply_token, "本群申請已送出，請等待最高管理員審核。")
+    name = group_name(gid)
+    rec = {"group_id": gid, "group_name": name, "status": "pending", "requested_by": uid,
+           "created_at": now_tw(), "source": "line_group"}
+    records = S.setdefault("driver_group_records", [])
+    records[:] = [x for x in records if not (isinstance(x, dict) and x.get("group_id") == gid)]
+    records.append(rec)
+    S.setdefault("pending_driver_group_requests", []).append({"group_id": gid, "requested_at": now_tw()})
+    S["pending_driver_group_requests"] = S["pending_driver_group_requests"][-500:]
+    audit_admin("driver_group_request", "driver_group", gid, detail="LINE 群組提出申請")
+    save()
+    return reply(event.reply_token, "已收到司機群組申請，待最高管理員核准後才能開始喊單。")
+
+
+def approve_driver_group(gid, actor="LINE群組操作"):
+    rec = group_record(gid)
+    if not rec:
+        return False, "找不到群組申請"
+    rec.update({"status": "approved", "approved_at": now_tw(), "approved_by": actor})
+    if gid not in S.setdefault("driver_groups", []): S["driver_groups"].append(gid)
+    if not S.get("driver_group"): S["driver_group"] = gid
+    S["pending_driver_group_requests"] = [x for x in S.get("pending_driver_group_requests", []) if x.get("group_id") != gid]
+    audit_admin("approve_driver_group", "driver_group", gid)
+    save(); return True, "已核准群組"
+
+
+def reject_driver_group(gid, actor="LINE群組操作"):
+    rec = group_record(gid)
+    if not rec: return False, "找不到群組申請"
+    rec.update({"status": "rejected", "rejected_at": now_tw(), "rejected_by": actor})
+    S["driver_groups"] = [x for x in S.get("driver_groups", []) if x != gid]
+    S["pending_driver_group_requests"] = [x for x in S.get("pending_driver_group_requests", []) if x.get("group_id") != gid]
+    audit_admin("reject_driver_group", "driver_group", gid)
+    save(); return True, "已拒絕群組申請"
+
+
+def unbind_driver_group(gid, reason="manual", actor="system"):
+    rec = group_record(gid)
+    if not rec:
+        rec = {"group_id": gid, "group_name": "司機群組", "created_at": now_tw()}
+        S.setdefault("driver_group_records", []).append(rec)
+    rec.update({"status": "unbound", "unbound_at": now_tw(), "unbind_reason": reason, "unbound_by": actor})
+    S["driver_groups"] = [x for x in S.get("driver_groups", []) if x != gid]
+    if S.get("driver_group") == gid:
+        S["driver_group"] = S["driver_groups"][0] if S["driver_groups"] else None
+    audit_admin("unbind_driver_group", "driver_group", gid, detail=reason)
+    save()
+
+
+@app.get("/api/admin/overview")
+def admin_overview():
+    if _current_dashboard_role() != "root_admin": abort(403)
+    groups = [x for x in S.get("driver_group_records", []) if isinstance(x, dict)]
+    return jsonify({"ok": True, "dispatchers": S.get("dispatcher_users", []),
+        "groups": groups, "pending_count": sum(1 for x in groups if x.get("status") == "pending"),
+        "audit": list(reversed(S.get("admin_audit_log", [])[-100:]))})
+
+
+@app.post("/api/admin/dispatcher")
+def admin_dispatcher_change():
+    if _current_dashboard_role() != "root_admin": abort(403)
+    data = request.get_json(silent=True) or {}; uid = str(data.get("user_id", "")).strip(); action = data.get("action")
+    if not uid or uid == S.get("root_admin_id"): return jsonify({"ok": False, "error": "請提供有效的 LINE User ID"}), 400
+    if action == "assign":
+        if uid not in S.setdefault("dispatcher_users", []): S["dispatcher_users"].append(uid)
+        if uid not in S.setdefault("admins", []): S["admins"].append(uid)
+        audit_admin("assign_dispatcher", "user", uid)
+    elif action == "revoke":
+        if uid not in S.get("dispatcher_users", []): return jsonify({"ok": False, "error": "此成員不是派單員"}), 404
+        S["dispatcher_users"] = [x for x in S["dispatcher_users"] if x != uid]
+        S["admins"] = [x for x in S.get("admins", []) if x != uid]
+        S.setdefault("permission_revocations", []).append({"user_id": uid, "group_id": S.get("dispatcher_group"), "revoked_at": now_tw(), "reason": "revoked_by_root_admin_web"})
+        audit_admin("revoke_dispatcher", "user", uid)
+    else: return jsonify({"ok": False, "error": "未知操作"}), 400
+    save(); return jsonify({"ok": True})
+
+
+@app.post("/api/admin/driver-group")
+def admin_driver_group_change():
+    if _current_dashboard_role() != "root_admin": abort(403)
+    data = request.get_json(silent=True) or {}; gid = str(data.get("group_id", "")).strip(); action = data.get("action")
+    if not gid: return jsonify({"ok": False, "error": "缺少群組 ID"}), 400
+    if action == "approve": ok, msg = approve_driver_group(gid, session.get("line_user_id"))
+    elif action == "reject": ok, msg = reject_driver_group(gid, session.get("line_user_id"))
+    elif action == "unbind":
+        if gid not in get_driver_groups(): return jsonify({"ok": False, "error": "群組目前未綁定"}), 404
+        unbind_driver_group(gid, "manual_by_root_admin_web", session.get("line_user_id")); ok, msg = True, "已解除綁定"
+    else: return jsonify({"ok": False, "error": "未知操作"}), 400
+    if not ok: return jsonify({"ok": False, "error": msg}), 404
+    return jsonify({"ok": True, "message": msg})
+
+
 # ---------------- 司機群組 / 派單員群組 ----------------
 def on_group(event, text, src):
     uid, gid, tok = src.user_id, src.group_id, event.reply_token
@@ -1120,11 +1280,12 @@ def on_group(event, text, src):
     if text in ("綁定司機群組", "綁定群組"):
         if not is_root_admin(uid):
             return reply(tok, "⛔ 只有最高管理員可以綁定司機群組。")
+        if not group_record(gid):
+            S.setdefault("driver_group_records", []).append({"group_id": gid, "group_name": group_name(gid), "status": "approved", "created_at": now_tw(), "approved_at": now_tw(), "approved_by": uid, "source": "legacy_bind_command"})
         S.setdefault("driver_groups", [])
-        if gid not in S["driver_groups"]:
-            S["driver_groups"].append(gid)
-        if not S.get("driver_group"):
-            S["driver_group"] = gid
+        if gid not in S["driver_groups"]: S["driver_groups"].append(gid)
+        if not S.get("driver_group"): S["driver_group"] = gid
+        audit_admin("bind_driver_group", "driver_group", gid)
         save()
         return reply(tok, f"✅ 已加入【司機群組】綁定。\n目前共綁定 {len(get_driver_groups())} 個司機群組。\n此群組可正常喊單及接收系統通知。")
 
@@ -1135,10 +1296,14 @@ def on_group(event, text, src):
         save()
         return reply(tok, "✅ 已由最高管理員綁定為【派單群組】。只有最高管理員及已指派派單員可在此操作。")
 
-    # 只接受已綁定群組；派單群組內再執行人員角色驗證。
+    # 未核准群組可提出申請，但不能喊單或進入派單流程。
+    if text in ("申請司機群組", "申請群組"):
+        return request_driver_group(event, src)
+
+    # 只接受已核准群組；派單群組內再執行人員角色驗證。
     if gid == S.get("dispatcher_group"):
         return on_dispatcher_group(event, text, src)
-    if gid in get_driver_groups():
+    if gid in active_driver_groups():
         return on_driver_group(event, text, src)
 
 
@@ -1194,6 +1359,19 @@ def on_dispatcher_group(event, text, src):
 
     # 最高管理員專屬管理及高風險指令
     if is_root_admin(uid):
+        if cmd in ("司機群組列表", "群組列表"):
+            rows = S.get("driver_group_records", [])
+            label = {"approved":"使用中", "pending":"待審核", "rejected":"已拒絕", "unbound":"已解除綁定"}
+            lines = [f"{i+1}. {x.get('group_name','司機群組')}｜{label.get(x.get('status'), x.get('status'))}｜{x.get('group_id')}" for i,x in enumerate(rows)]
+            return reply(tok, "📋 司機群組管理\n" + ("\n".join(lines) if lines else "目前沒有群組紀錄。"))
+        if cmd.startswith("核准司機群組 "):
+            gid = cmd.split(" ",1)[1].strip(); ok,msg = approve_driver_group(gid, uid); return reply(tok, ("✅ " if ok else "⛔ ")+msg)
+        if cmd.startswith("拒絕司機群組 "):
+            gid = cmd.split(" ",1)[1].strip(); ok,msg = reject_driver_group(gid, uid); return reply(tok, ("✅ " if ok else "⛔ ")+msg)
+        if cmd.startswith("解除司機群組 "):
+            gid = cmd.split(" ",1)[1].strip()
+            if gid not in get_driver_groups(): return reply(tok, "該群組目前未綁定。")
+            unbind_driver_group(gid, "manual_by_root_admin_line", uid); return reply(tok, "✅ 已解除群組綁定並保留歷史紀錄。")
         if cmd == "清理全部":
             return reply(tok, clear_all_pending_shouts())
         if cmd in ("訂單列表", "列表", "可接訂單"):
@@ -1210,6 +1388,7 @@ def on_dispatcher_group(event, text, src):
             S.setdefault("dispatcher_users", []).append(target)
             if target not in S.setdefault("admins", []):
                 S["admins"].append(target)
+            audit_admin("assign_dispatcher", "user", target, detail="LINE 派單群組指派")
             save()
             return reply(tok, f"✅ 已指派派單員。\nLINE User ID：{target}\n該成員可在本派單群組執行派單操作。")
         if cmd.startswith("撤銷派單"):
@@ -1223,6 +1402,7 @@ def on_dispatcher_group(event, text, src):
             S["admins"] = [x for x in S.get("admins", []) if x != target]
             S.setdefault("permission_revocations", []).append({"user_id": target, "group_id": S.get("dispatcher_group"), "revoked_at": now_tw(), "reason": "revoked_by_root_admin"})
             S["permission_revocations"] = S["permission_revocations"][-500:]
+            audit_admin("revoke_dispatcher", "user", target, detail="LINE 派單群組撤銷")
             save()
             return reply(tok, f"🔒 已撤銷派單員權限。\nLINE User ID：{target}\n全系統派單權限立即失效。")
         if cmd == "派單員列表":
