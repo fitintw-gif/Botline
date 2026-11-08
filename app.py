@@ -105,14 +105,15 @@ def load():
 
 
 def get_driver_groups():
-    """回傳所有已綁定司機群組，並兼容舊版單一群組欄位。"""
-    groups = S.get("driver_groups", [])
-    if not isinstance(groups, list):
-        groups = []
+    """以審核紀錄 approved 狀態作唯一有效群組來源，避免解除後被舊欄位復活。"""
+    records = S.get("driver_group_records", [])
+    if isinstance(records, list) and records:
+        return list(dict.fromkeys(x.get("group_id") for x in records
+            if isinstance(x, dict) and x.get("status") == "approved" and x.get("group_id")))
+    groups = S.get("driver_groups", []) if isinstance(S.get("driver_groups"), list) else []
     legacy = S.get("driver_group")
-    if legacy and legacy not in groups:
-        groups = groups + [legacy]
-    return groups
+    if legacy and legacy not in groups: groups.append(legacy)
+    return list(dict.fromkeys(x for x in groups if x))
 
 
 def audit_admin(action, target_type, target_id, result="success", detail=""):
@@ -436,16 +437,60 @@ def pending_shouts():
 
 
 def group_name(group_id):
-    """透過 LINE 群組摘要取得群組名稱；無法取得時使用預設名稱。"""
-    if not group_id:
-        return "司機群組"
+    """讀取 LINE 最新群組名稱；失敗回傳 None，保留上次成功名稱。"""
+    if not group_id: return None
     try:
         with ApiClient(config) as c:
             summary = MessagingApi(c).get_group_summary(group_id)
-        return getattr(summary, "group_name", None) or "司機群組"
+        return getattr(summary, "group_name", None) or None
     except Exception as e:
         print("get group summary failed:", err_text(e), flush=True)
-        return "司機群組"
+        return None
+
+
+def register_joined_driver_group(group_id):
+    """Bot 加入群組即自動建立待審核；重新加入已解除/拒絕群組也必須重審。"""
+    if not group_id: return "missing"
+    rec = group_record(group_id)
+    latest = group_name(group_id)
+    if rec and latest:
+        rec["group_name"] = latest
+        rec["name_updated_at"] = now_tw()
+    if rec and rec.get("status") == "approved":
+        save(); return "approved"
+    if rec and rec.get("status") == "pending":
+        save(); return "pending"
+    if rec:
+        rec.update({"status":"pending", "requested_at":now_tw(), "requested_by":"bot_join_event",
+                    "source":"bot_auto_join", "rejoin_after_unbind":True})
+        if latest: rec["group_name"] = latest
+    else:
+        rec = {"group_id":group_id, "group_name":latest or "群組名稱待更新", "status":"pending",
+               "created_at":now_tw(), "requested_at":now_tw(), "requested_by":"bot_join_event", "source":"bot_auto_join"}
+        S.setdefault("driver_group_records", []).append(rec)
+    S["driver_groups"] = [x for x in S.get("driver_groups", []) if x != group_id]
+    if S.get("driver_group") == group_id:
+        S["driver_group"] = S["driver_groups"][0] if S["driver_groups"] else None
+    S["pending_driver_group_requests"] = [x for x in S.get("pending_driver_group_requests", []) if x.get("group_id") != group_id]
+    S["pending_driver_group_requests"].append({"group_id":group_id,"requested_at":now_tw(),"source":"bot_auto_join"})
+    S["pending_driver_group_requests"] = S["pending_driver_group_requests"][-500:]
+    audit_admin("driver_group_auto_request", "driver_group", group_id, detail="Bot 加入群組，自動建立待審核申請")
+    save(); return "pending"
+
+
+def refresh_group_names(max_age_seconds=600):
+    """後台讀取時最多每群 10 分鐘更新一次名稱；API 失敗保留舊名稱。"""
+    now = time.time(); changed = False
+    for rec in S.get("driver_group_records", []):
+        if not isinstance(rec, dict) or not rec.get("group_id"): continue
+        try: last = float(rec.get("name_checked_ts", 0) or 0)
+        except (TypeError, ValueError): last = 0
+        if now - last < max_age_seconds: continue
+        rec["name_checked_ts"] = now; changed = True
+        latest = group_name(rec["group_id"])
+        if latest and latest != rec.get("group_name"):
+            rec["group_name"] = latest; rec["name_updated_at"] = now_tw()
+    if changed: save()
 
 
 def clear_all_pending_shouts():
@@ -726,7 +771,7 @@ button.active{background:#173e4a;color:white}.pill{font-size:11px;padding:6px 9p
 @media(max-width:400px){.app{padding:10px}.stat{padding:10px}.num{font-size:23px}}
 </style></head><body><main class="app">
 <header><div class="brand"><b>🚘</b> CAR SPEED</div><h1>派單即時看板</h1>
-<div class="sub">司機喊單與回覆同步｜派單人員專用</div><span class="live" id="live">● 正在連線</span>
+<div class="sub">司機喊單與回覆同步｜派單人員專用</div><span class="live" id="live">● 正在連線</span><button id="relogin" type="button" style="display:none;margin-top:10px" onclick="reloginLine()">重新登入 LINE</button>
 <div class="sub" id="updated" style="margin-top:9px">資料載入中…</div></header>
 <section class="stats">
 <div class="stat"><div class="num" id="dispatchCount">—</div><small>進行中派單</small></div>
@@ -781,28 +826,35 @@ document.getElementById("clearCompleted").addEventListener("click",async()=>{
  if(!confirm("確定清理全部已完成紀錄？包含已保留的紀錄也會一併刪除，無法復原。"))return;
  try{const r=await postAction("/api/dashboard/clear-completed",{});alert("已清理 "+r.deleted+" 筆完成紀錄。");await refresh()}catch(err){alert(err.message)}
 });
-async function refresh(){const y=window.scrollY;try{const r=await fetch("/api/dashboard",{cache:"no-store",credentials:"same-origin"});if(!r.ok)throw new Error(r.status===403?"LINE 身分未授權或登入已失效":"連線失敗（"+r.status+"）");render(await r.json());window.scrollTo(0,y)}catch(e){document.getElementById("live").textContent="● "+e.message;document.getElementById("live").style.background="#ffe5e5";document.getElementById("live").style.color="#9b2929"}}
+let refreshBusy=false,adminBusy=false,pollTimer=null;
+function showDashboardError(message,auth=false){const el=document.getElementById("live");el.textContent="● "+message;el.style.background="#ffe5e5";el.style.color="#9b2929";document.getElementById("relogin").style.display=auth?"inline-block":"none"}
+async function refresh(){if(refreshBusy)return;refreshBusy=true;const y=window.scrollY;try{const r=await fetch("/api/dashboard",{cache:"no-store",credentials:"same-origin"});if(!r.ok){if(r.status===401||r.status===403)showDashboardError("登入或權限已失效，請重新登入",true);else showDashboardError("資料同步失敗（"+r.status+"）");return}render(await r.json());window.scrollTo(0,y)}catch(e){showDashboardError(e.message)}finally{refreshBusy=false}}
 document.querySelectorAll("[data-filter]").forEach(b=>b.addEventListener("click",()=>{filter=b.dataset.filter;document.querySelectorAll("[data-filter]").forEach(x=>x.classList.toggle("active",x===b));refresh()}));
 async function adminPost(path,payload){const r=await fetch(path,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});const x=await r.json().catch(()=>({}));if(!r.ok||!x.ok)throw new Error(x.error||"管理操作失敗");return x}
-async function loadAdmin(){if(currentRole!=="root_admin")return;const r=await fetch("/api/admin/overview",{cache:"no-store",credentials:"same-origin"});if(!r.ok)throw new Error("管理資料讀取失敗");const d=await r.json();document.getElementById("adminDispatcherCount").textContent=d.dispatchers.length;document.getElementById("adminGroupCount").textContent=d.groups.filter(x=>x.status==="approved").length;document.getElementById("adminPendingCount").textContent=d.pending_count;document.getElementById("dispatcherList").innerHTML=d.dispatchers.length?d.dispatchers.map(x=>`<div style="padding:7px 0;border-bottom:1px solid #edf0f1">${esc(x)}</div>`).join(""):"目前沒有派單員";const names={approved:"使用中",pending:"待審核",rejected:"已拒絕",unbound:"已解除綁定"};document.getElementById("groupList").innerHTML=d.groups.length?d.groups.map(g=>`<div style="padding:10px 0;border-bottom:1px solid #edf0f1"><b>${esc(g.group_name||"司機群組")}</b> <span class="pill ${g.status==="approved"?"yes":"wait"}">${names[g.status]||esc(g.status)}</span><div class="muted" style="font-size:10px;word-break:break-all">${esc(g.group_id)}</div>${g.status==="pending"?`<button data-group-action="approve" data-gid="${esc(g.group_id)}">核准</button> <button data-group-action="reject" data-gid="${esc(g.group_id)}">拒絕</button>`:g.status==="approved"?`<button data-group-action="unbind" data-gid="${esc(g.group_id)}">解除綁定</button>`:""}</div>`).join(""):"目前沒有群組紀錄";document.getElementById("adminAudit").innerHTML=d.audit.length?d.audit.map(a=>`<div style="padding:6px 0;border-bottom:1px solid #edf0f1">${esc(a.created_at)}｜${esc(a.action)}｜${esc(a.target_id)}｜${esc(a.result)}</div>`).join(""):"尚無管理操作紀錄"}
+async function loadAdmin(){if(currentRole!=="root_admin"||adminBusy)return;adminBusy=true;try{const r=await fetch("/api/admin/overview",{cache:"no-store",credentials:"same-origin"});if(!r.ok)throw new Error("管理資料讀取失敗");const d=await r.json();document.getElementById("adminDispatcherCount").textContent=d.dispatchers.length;document.getElementById("adminGroupCount").textContent=d.groups.filter(x=>x.status==="approved").length;document.getElementById("adminPendingCount").textContent=d.pending_count;document.getElementById("dispatcherList").innerHTML=d.dispatchers.length?d.dispatchers.map(x=>`<div style="padding:7px 0;border-bottom:1px solid #edf0f1">${esc(x)}</div>`).join(""):"目前沒有派單員";const names={approved:"使用中",pending:"待審核",rejected:"已拒絕",unbound:"已解除綁定"};document.getElementById("groupList").innerHTML=d.groups.length?d.groups.map(g=>`<div style="padding:10px 0;border-bottom:1px solid #edf0f1"><b>${esc(g.group_name||"司機群組")}</b> <span class="pill ${g.status==="approved"?"yes":"wait"}">${names[g.status]||esc(g.status)}</span><div class="muted" style="font-size:10px;word-break:break-all">${esc(g.group_id)}</div>${g.status==="pending"?`<button data-group-action="approve" data-gid="${esc(g.group_id)}">核准</button> <button data-group-action="reject" data-gid="${esc(g.group_id)}">拒絕</button>`:g.status==="approved"?`<button data-group-action="unbind" data-gid="${esc(g.group_id)}">解除綁定</button>`:""}</div>`).join(""):"目前沒有群組紀錄";document.getElementById("adminAudit").innerHTML=d.audit.length?d.audit.map(a=>`<div style="padding:6px 0;border-bottom:1px solid #edf0f1">${esc(a.created_at)}｜${esc(a.action)}｜${esc(a.target_id)}｜${esc(a.result)}</div>`).join(""):"尚無管理操作紀錄"}finally{adminBusy=false}}
 document.getElementById("assignDispatcher").addEventListener("click",async()=>{const user_id=document.getElementById("dispatcherUid").value.trim();if(!user_id)return alert("請輸入 LINE User ID");if(!confirm("確定指派此 LINE User ID 為派單員？"))return;try{await adminPost("/api/admin/dispatcher",{action:"assign",user_id});alert("派單員指派成功");document.getElementById("dispatcherUid").value="";await loadAdmin()}catch(e){alert(e.message)}});
 document.getElementById("revokeDispatcher").addEventListener("click",async()=>{const user_id=document.getElementById("dispatcherUid").value.trim();if(!user_id)return alert("請輸入要撤銷的 LINE User ID");if(!confirm("確定撤銷此派單員的全系統權限？"))return;try{await adminPost("/api/admin/dispatcher",{action:"revoke",user_id});alert("派單員權限已撤銷");document.getElementById("dispatcherUid").value="";await loadAdmin()}catch(e){alert(e.message)}});
 document.getElementById("revokeDispatcher").addEventListener("click",async()=>{const user_id=document.getElementById("dispatcherUid").value.trim();if(!user_id)return alert("請輸入 LINE User ID");if(!confirm("確定撤銷此派單員權限？"))return;try{await adminPost("/api/admin/dispatcher",{action:"revoke",user_id});alert("派單員權限已撤銷");document.getElementById("dispatcherUid").value="";await loadAdmin()}catch(e){alert(e.message)}});
 document.getElementById("groupList").addEventListener("click",async e=>{const b=e.target.closest("[data-group-action]");if(!b)return;const action=b.dataset.groupAction,group_id=b.dataset.gid;if(!confirm("確定執行「"+action+"」？"))return;try{await adminPost("/api/admin/driver-group",{action,group_id});await loadAdmin()}catch(err){alert(err.message)}});
+async function reloginLine(){
+ try{document.getElementById("relogin").style.display="none";if(!window.liff)throw new Error("LINE LIFF SDK 尚未載入");if(liff.isLoggedIn())liff.logout();liff.login({redirectUri:location.href})}
+ catch(e){showDashboardError("重新登入失敗："+e.message,true)}
+}
 async function startLiff(){
  try{
   if(!LIFF_ID)throw new Error("LIFF_ID 尚未設定，請聯絡系統管理員");
   if(!window.liff)throw new Error("LINE LIFF SDK 載入失敗");
   await liff.init({liffId:LIFF_ID});
   if(!liff.isLoggedIn()){liff.login({redirectUri:location.href});return;}
-  const idToken=liff.getIDToken();if(!idToken)throw new Error("無法取得 LINE ID Token，請確認 LIFF scopes 已啟用 openid");
+  const idToken=liff.getIDToken();if(!idToken)throw new Error("無法取得 LINE ID Token，請重新登入 LINE");
   const auth=await fetch("/api/auth/line",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify({id_token:idToken})});
-  const result=await auth.json().catch(()=>({}));if(!auth.ok)throw new Error(result.error||"LINE 身分驗證失敗或尚未取得系統權限");
-  currentRole=result.role;
-  document.getElementById("adminPanel").style.display=currentRole==="root_admin"?"block":"none";
-  if(currentRole==="root_admin")await loadAdmin();
-  await refresh();setInterval(async()=>{await refresh();if(currentRole==="root_admin")await loadAdmin()},5000);
- }catch(e){document.getElementById("live").textContent="● "+e.message;document.getElementById("live").style.background="#ffe5e5";document.getElementById("live").style.color="#9b2929";}
+  const result=await auth.json().catch(()=>({}));
+  if(!auth.ok){const msg=result.error||"LINE 身分驗證失敗";showDashboardError(msg.toLowerCase().includes("expired")?"LINE 登入憑證已過期，請重新登入":"LINE 身分驗證失敗："+msg,true);return;}
+  currentRole=result.role;document.getElementById("adminPanel").style.display=currentRole==="root_admin"?"block":"none";
+  await refresh();if(currentRole==="root_admin")await loadAdmin();
+  if(pollTimer)clearInterval(pollTimer);
+  pollTimer=setInterval(async()=>{await refresh();if(currentRole==="root_admin")await loadAdmin()},5000);
+ }catch(e){showDashboardError(e.message,true)}
 }
 startLiff();
 </script></body></html>"""
@@ -1054,17 +1106,25 @@ def dashboard_data():
 
 @handler.add(JoinEvent)
 def on_join(event):
-    """首次初始化：群組初始只有機器人與一位成員；以該群第一位回應者作本人確認對象。"""
+    """保留首次最高管理員初始化；一般群組在 Bot 加入時自動送出待審核申請。"""
     try:
         src = event.source
-        if isinstance(src, GroupSource) and not S.get("root_admin_id") and not S.get("bootstrap_initialized"):
+        if not isinstance(src, GroupSource): return
+        gid = src.group_id
+        if not S.get("root_admin_id") and not S.get("bootstrap_initialized"):
             if not S.get("bootstrap_group_id"):
-                S["bootstrap_group_id"] = src.group_id
+                S["bootstrap_group_id"] = gid
                 S["bootstrap_candidate_user_id"] = None
                 save()
-            if src.group_id == S.get("bootstrap_group_id"):
+            if gid == S.get("bootstrap_group_id"):
                 reply(event.reply_token,
                       "⚙️ CAR SPEED 首次初始化\n目前尚未設定最高管理員。\n請由本群唯一成員回覆任一訊息，機器人將向本人確認是否擔任最高管理員。\n確認指令：確認擔任最高管理員\n暫緩指令：暫不設定")
+                return
+        result = register_joined_driver_group(gid)
+        if result == "pending":
+            reply(event.reply_token, "🚘 CAR SPEED 已自動取得本群 Group ID，並建立待審核申請。\n請等待最高管理員於網頁後台核准；核准前無法喊單或接收派單。")
+        elif result == "approved":
+            reply(event.reply_token, "✅ CAR SPEED 已確認本群為核准中的司機群組。")
     except Exception as e:
         STATS["last_err"] = f"{now_tw()} {err_text(e)}"
         print("join handler error:", err_text(e), flush=True)
@@ -1182,11 +1242,12 @@ def request_driver_group(event, src):
     if rec and rec.get("status") == "pending":
         return reply(event.reply_token, "本群申請已送出，請等待最高管理員審核。")
     name = group_name(gid)
-    rec = {"group_id": gid, "group_name": name, "status": "pending", "requested_by": uid,
+    rec = {"group_id": gid, "group_name": name or "群組名稱待更新", "status": "pending", "requested_by": uid,
            "created_at": now_tw(), "source": "line_group"}
     records = S.setdefault("driver_group_records", [])
     records[:] = [x for x in records if not (isinstance(x, dict) and x.get("group_id") == gid)]
     records.append(rec)
+    S["pending_driver_group_requests"] = [x for x in S.get("pending_driver_group_requests", []) if x.get("group_id") != gid]
     S.setdefault("pending_driver_group_requests", []).append({"group_id": gid, "requested_at": now_tw()})
     S["pending_driver_group_requests"] = S["pending_driver_group_requests"][-500:]
     audit_admin("driver_group_request", "driver_group", gid, detail="LINE 群組提出申請")
@@ -1232,6 +1293,7 @@ def unbind_driver_group(gid, reason="manual", actor="system"):
 @app.get("/api/admin/overview")
 def admin_overview():
     if _current_dashboard_role() != "root_admin": abort(403)
+    refresh_group_names()
     groups = [x for x in S.get("driver_group_records", []) if isinstance(x, dict)]
     return jsonify({"ok": True, "dispatchers": S.get("dispatcher_users", []),
         "groups": groups, "pending_count": sum(1 for x in groups if x.get("status") == "pending"),
@@ -1276,18 +1338,9 @@ def admin_driver_group_change():
 def on_group(event, text, src):
     uid, gid, tok = src.user_id, src.group_id, event.reply_token
 
-    # 群組綁定只允許最高管理員；首次綁定命令是未綁定群組的唯一例外入口。
+    # 舊綁定指令不再繞過網頁審核。
     if text in ("綁定司機群組", "綁定群組"):
-        if not is_root_admin(uid):
-            return reply(tok, "⛔ 只有最高管理員可以綁定司機群組。")
-        if not group_record(gid):
-            S.setdefault("driver_group_records", []).append({"group_id": gid, "group_name": group_name(gid), "status": "approved", "created_at": now_tw(), "approved_at": now_tw(), "approved_by": uid, "source": "legacy_bind_command"})
-        S.setdefault("driver_groups", [])
-        if gid not in S["driver_groups"]: S["driver_groups"].append(gid)
-        if not S.get("driver_group"): S["driver_group"] = gid
-        audit_admin("bind_driver_group", "driver_group", gid)
-        save()
-        return reply(tok, f"✅ 已加入【司機群組】綁定。\n目前共綁定 {len(get_driver_groups())} 個司機群組。\n此群組可正常喊單及接收系統通知。")
+        return reply(tok, "司機群組採自動申請制：Bot 加入群組後會自動取得 Group ID 並送交最高管理員審核，無須手動輸入綁定指令。")
 
     if text == "綁定派單群組":
         if not is_root_admin(uid):
