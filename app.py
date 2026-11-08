@@ -1252,9 +1252,9 @@ def on_dispatcher_group(event, text, src):
                                   target_group_id=shout.get("source_group"))
         return reply(tok, f"已將回覆排入 {driver_name} 原本喊單的司機群組。\n該紀錄將保留在「已回覆」48 小時，之後自動轉入「已完成」。")
 
-    if is_root_admin(uid):
-        return reply(tok, ROOT_HELP)
-    return reply(tok, DISPATCHER_HELP)
+    # 未符合任何已知指令時不回覆 Help，避免一般文字（例如 456）
+    # 被誤判為指令並反覆輸出完整指令說明。
+    return None
 
 
 # ---------------- 被動刷單：只在司機群組使用 Reply ----------------
