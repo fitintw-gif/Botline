@@ -4,8 +4,11 @@ import re
 import time
 import tempfile
 import uuid
+import urllib.parse
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone, timedelta
-from flask import Flask, request, abort, jsonify
+from flask import Flask, request, abort, jsonify, session
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
@@ -32,6 +35,17 @@ STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 RESEND_INTERVAL = int(os.environ.get("RESEND_INTERVAL", "30"))
 
 app = Flask(__name__)
+# LINE Login / LIFF：正式環境必須由 Render 設定高強度 FLASK_SECRET_KEY。
+FLASK_SECRET_KEY = os.environ.get("FLASK_SECRET_KEY", "").strip()
+LINE_LOGIN_CHANNEL_ID = os.environ.get("LINE_LOGIN_CHANNEL_ID", "").strip()
+LIFF_ID = os.environ.get("LIFF_ID", "").strip()
+app.secret_key = FLASK_SECRET_KEY or None
+app.config.update(
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+)
 handler = WebhookHandler(CHANNEL_SECRET)
 config = Configuration(access_token=CHANNEL_TOKEN)
 
@@ -651,9 +665,7 @@ def health():
 
 
 # ---------------- LIFF / 網頁即時派單看板 ----------------
-# Render 環境變數 DASHBOARD_TOKEN 設定一組獨立看板密碼；
-# 看板網址格式：https://你的服務網址/dashboard?key=密碼
-DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "").strip()
+# 新版以 LINE Login 身分 + 後端角色授權，不再以共用 query key 作為登入依據。
 
 DASHBOARD_HTML = r"""<!doctype html>
 <html lang="zh-Hant"><head><meta charset="utf-8">
@@ -689,9 +701,10 @@ button.active{background:#173e4a;color:white}.pill{font-size:11px;padding:6px 9p
 <div class="bar" id="completedTools" style="display:none"><span class="muted" style="font-size:12px">已完成紀錄可保留；未保留者 14 天後自動刪除</span><button id="clearCompleted" style="background:#fff0f0;color:#a33;border-color:#f0cccc">全部清理</button></div>
 <div id="replies"><div class="empty">正在載入資料…</div></div>
 <div class="bar"><h2>目前進行中的派單</h2></div><div id="dispatches"><div class="empty">正在載入資料…</div></div>
-<div class="foot">CAR SPEED｜頁面每 5 秒自動同步<br>資料僅供已取得看板連結的人員查看</div>
-</main><script>
-const key=new URLSearchParams(location.search).get("key")||"";let filter="all";
+<section id="adminPanel" style="display:none;margin-top:20px"><div class="bar"><h2>最高管理員專區</h2></div><article class="card"><b>管理員身分已驗證</b><div class="info">此區僅最高管理員可見。群組申請審核等管理功能將在後續階段接入；目前不會改動既有群組綁定及權限資料。</div></article></section>
+<div class="foot">CAR SPEED｜LINE 身分驗證｜頁面每 5 秒自動同步</div>
+</main><script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script><script>
+const LIFF_ID=__LIFF_ID_JSON__;let filter="all";let currentRole=null;
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 function cardReply(x){
  const done=x.status==="completed";
@@ -714,7 +727,7 @@ function render(data){
  document.getElementById("live").textContent="● 即時同步中";
 }
 async function postAction(url,payload){
- const r=await fetch(url+"?key="+encodeURIComponent(key),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload||{})});
+ const r=await fetch(url,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload||{})});
  const result=await r.json().catch(()=>({}));
  if(!r.ok||!result.ok)throw new Error(result.error||"操作失敗");
  return result;
@@ -727,23 +740,94 @@ document.getElementById("clearCompleted").addEventListener("click",async()=>{
  if(!confirm("確定清理全部已完成紀錄？包含已保留的紀錄也會一併刪除，無法復原。"))return;
  try{const r=await postAction("/api/dashboard/clear-completed",{});alert("已清理 "+r.deleted+" 筆完成紀錄。");await refresh()}catch(err){alert(err.message)}
 });
-async function refresh(){const y=window.scrollY;try{const r=await fetch("/api/dashboard?key="+encodeURIComponent(key),{cache:"no-store"});if(!r.ok)throw new Error(r.status===403?"看板密碼錯誤或未設定":"連線失敗（"+r.status+"）");render(await r.json());window.scrollTo(0,y)}catch(e){document.getElementById("live").textContent="● "+e.message;document.getElementById("live").style.background="#ffe5e5";document.getElementById("live").style.color="#9b2929"}}
+async function refresh(){const y=window.scrollY;try{const r=await fetch("/api/dashboard",{cache:"no-store",credentials:"same-origin"});if(!r.ok)throw new Error(r.status===403?"LINE 身分未授權或登入已失效":"連線失敗（"+r.status+"）");render(await r.json());window.scrollTo(0,y)}catch(e){document.getElementById("live").textContent="● "+e.message;document.getElementById("live").style.background="#ffe5e5";document.getElementById("live").style.color="#9b2929"}}
 document.querySelectorAll("[data-filter]").forEach(b=>b.addEventListener("click",()=>{filter=b.dataset.filter;document.querySelectorAll("[data-filter]").forEach(x=>x.classList.toggle("active",x===b));refresh()}));
-refresh();setInterval(refresh,5000);
+async function startLiff(){
+ try{
+  if(!LIFF_ID)throw new Error("LIFF_ID 尚未設定，請聯絡系統管理員");
+  if(!window.liff)throw new Error("LINE LIFF SDK 載入失敗");
+  await liff.init({liffId:LIFF_ID});
+  if(!liff.isLoggedIn()){liff.login({redirectUri:location.href});return;}
+  const idToken=liff.getIDToken();if(!idToken)throw new Error("無法取得 LINE ID Token，請確認 LIFF scopes 已啟用 openid");
+  const auth=await fetch("/api/auth/line",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify({id_token:idToken})});
+  const result=await auth.json().catch(()=>({}));if(!auth.ok)throw new Error(result.error||"LINE 身分驗證失敗或尚未取得系統權限");
+  currentRole=result.role;
+  document.getElementById("adminPanel").style.display=currentRole==="root_admin"?"block":"none";
+  await refresh();setInterval(refresh,5000);
+ }catch(e){document.getElementById("live").textContent="● "+e.message;document.getElementById("live").style.background="#ffe5e5";document.getElementById("live").style.color="#9b2929";}
+}
+startLiff();
 </script></body></html>"""
 
 
+def _line_id_token_verify(id_token):
+    if not LINE_LOGIN_CHANNEL_ID:
+        raise RuntimeError("LINE_LOGIN_CHANNEL_ID 尚未設定")
+    payload=urllib.parse.urlencode({"id_token":id_token,"client_id":LINE_LOGIN_CHANNEL_ID}).encode("utf-8")
+    req=urllib.request.Request("https://api.line.me/oauth2/v2.1/verify",data=payload,headers={"Content-Type":"application/x-www-form-urlencoded"},method="POST")
+    try:
+        with urllib.request.urlopen(req,timeout=8) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail=e.read().decode("utf-8",errors="replace")[:300]
+        raise ValueError("LINE Token 驗證失敗："+detail)
+
+
+def _current_dashboard_role():
+    uid=session.get("line_user_id")
+    if not uid:return None
+    if uid==S.get("root_admin_id"):return "root_admin"
+    if uid in S.get("dispatcher_users",[]):return "dispatcher"
+    return None
+
+
 def dashboard_authorized():
-    return bool(DASHBOARD_TOKEN and request.args.get("key", "") == DASHBOARD_TOKEN)
+    return _current_dashboard_role() in ("root_admin","dispatcher")
+
+
+@app.post("/api/auth/line")
+def dashboard_line_login():
+    if not FLASK_SECRET_KEY:
+        return jsonify({"ok":False,"error":"伺服器尚未設定 FLASK_SECRET_KEY"}),503
+    payload=request.get_json(silent=True) or {}
+    id_token=str(payload.get("id_token", "")).strip()
+    if not id_token:return jsonify({"ok":False,"error":"缺少 LINE ID Token"}),400
+    try:
+        claims=_line_id_token_verify(id_token)
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)[:300]}),401
+    uid=claims.get("sub")
+    if not uid:return jsonify({"ok":False,"error":"LINE Token 缺少使用者識別"}),401
+    role="root_admin" if uid==S.get("root_admin_id") else ("dispatcher" if uid in S.get("dispatcher_users",[]) else None)
+    if not role:
+        session.clear()
+        return jsonify({"ok":False,"error":"此 LINE 帳號尚未取得 CAR SPEED 看板權限"}),403
+    session.clear();session.permanent=True
+    session["line_user_id"]=uid
+    return jsonify({"ok":True,"role":role})
+
+
+@app.get("/api/auth/me")
+def dashboard_auth_me():
+    role=_current_dashboard_role()
+    if not role:
+        session.clear()
+        return jsonify({"ok":False,"error":"尚未登入或權限已撤銷"}),401
+    return jsonify({"ok":True,"role":role})
+
+
+@app.post("/api/auth/logout")
+def dashboard_logout():
+    session.clear()
+    return jsonify({"ok":True})
 
 
 @app.get("/dashboard")
 def dashboard_page():
-    if not DASHBOARD_TOKEN:
-        return "請先在 Render 設定 DASHBOARD_TOKEN 環境變數。", 503
-    if not dashboard_authorized():
-        abort(403)
-    return DASHBOARD_HTML
+    if not LIFF_ID or not LINE_LOGIN_CHANNEL_ID or not FLASK_SECRET_KEY:
+        return "LINE Login 尚未完成伺服器設定。", 503
+    html=DASHBOARD_HTML.replace("__LIFF_ID_JSON__",json.dumps(LIFF_ID))
+    return html, 200, {"Cache-Control":"no-store"}
 
 
 def _order_timestamp(order, key, fallback_key="created_at"):
