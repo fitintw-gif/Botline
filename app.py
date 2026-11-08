@@ -15,7 +15,8 @@ from linebot.v3.messaging import (
 from linebot.v3.messaging.models import (
     TextMessageV2, MentionSubstitutionObject, UserMentionTarget,
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent, GroupSource, UserSource
+from linebot.v3.webhooks import (MessageEvent, TextMessageContent, GroupSource, UserSource,
+                                 JoinEvent, MemberLeftEvent)
 
 # ============================================================
 # CAR SPEED 雙群組版
@@ -27,7 +28,6 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent, GroupSource, U
 
 CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 CHANNEL_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "change-me")
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 RESEND_INTERVAL = int(os.environ.get("RESEND_INTERVAL", "30"))
 
@@ -38,7 +38,9 @@ config = Configuration(access_token=CHANNEL_TOKEN)
 
 def default_state():
     return {
-        "admin": None, "admins": [],
+        "admin": None, "admins": [], "root_admin_id": None, "dispatcher_users": [],
+        "bootstrap_group_id": None, "bootstrap_candidate_user_id": None, "bootstrap_initialized": False,
+        "pending_root_transfer": None, "permission_revocations": [],
         "driver_group": None, "driver_groups": [], "dispatcher_group": None,
         "next_id": 1, "orders": {}, "drivers": {},
         "dispatcher_replies": [], "pending_notifications": [], "last_passive_ts": 0.0, "seen_message_ids": []
@@ -63,7 +65,7 @@ def load():
     for key in ("orders", "drivers"):
         if not isinstance(data.get(key), dict):
             data[key] = {}
-    for key in ("admins", "dispatcher_replies", "pending_notifications", "seen_message_ids", "driver_groups"):
+    for key in ("admins", "dispatcher_users", "dispatcher_replies", "pending_notifications", "seen_message_ids", "driver_groups", "permission_revocations"):
         if not isinstance(data.get(key), list):
             data[key] = []
     # 相容舊版單一 driver_group：升級時自動納入多群組清單，不遺失舊綁定。
@@ -88,10 +90,18 @@ def get_driver_groups():
 
 
 S = load()
-if not S.get("admin") and os.environ.get("ADMIN_USER_ID"):
-    S["admin"] = os.environ["ADMIN_USER_ID"]
-    if S["admin"] not in S["admins"]:
-        S["admins"].append(S["admin"])
+# v3.4 相容遷移：既有 admin 保留為最高管理員；其餘既有 admins 保留為派單員，避免升級後權限突然遺失。
+legacy_root = S.get("root_admin_id") or S.get("admin") or os.environ.get("ADMIN_USER_ID")
+if legacy_root:
+    S["root_admin_id"] = legacy_root
+    S["admin"] = legacy_root  # 舊版相容欄位
+    S["bootstrap_initialized"] = True
+    legacy_dispatchers = [x for x in S.get("admins", []) if x and x != legacy_root]
+    for x in legacy_dispatchers:
+        if x not in S["dispatcher_users"]:
+            S["dispatcher_users"].append(x)
+    if legacy_root not in S["admins"]:
+        S["admins"].append(legacy_root)
 # 可用 DRIVER_GROUP_IDS 設定多個司機群組 ID，以逗號分隔。
 for env_group_id in os.environ.get("DRIVER_GROUP_IDS", "").split(","):
     env_group_id = env_group_id.strip()
@@ -305,8 +315,40 @@ def driver_group_reply(event, text=None, allow_passive=True):
         save()
 
 
+def is_root_admin(user_id):
+    return bool(user_id and user_id == S.get("root_admin_id"))
+
+
+def is_dispatcher(user_id):
+    return bool(user_id and user_id in S.get("dispatcher_users", []))
+
+
+def is_authorized_dispatcher(user_id):
+    return is_root_admin(user_id) or is_dispatcher(user_id)
+
+
 def is_admin(user_id):
-    return bool(user_id and user_id in S.get("admins", []))
+    """相容舊呼叫：管理員包含最高管理員與已授權派單員。"""
+    return is_authorized_dispatcher(user_id)
+
+
+def mentioned_user_ids(message):
+    mention = getattr(message, "mention", None)
+    ids = []
+    for item in getattr(mention, "mentionees", []) or []:
+        uid = getattr(item, "user_id", None)
+        if uid and uid not in ids:
+            ids.append(uid)
+    return ids
+
+
+def help_for_user(user_id):
+    if is_root_admin(user_id):
+        return ROOT_HELP
+    if is_dispatcher(user_id):
+        return DISPATCHER_HELP
+    return BASIC_HELP
+
 
 
 def remember_message(message_id):
@@ -583,7 +625,7 @@ def record_shout(event, group_id, user_id, content):
         "driver_user_id": user_id, "content": content,
         "source_message_id": getattr(event.message, "id", None),
         "quote_token": getattr(event.message, "quote_token", None),
-        "created_at": now_tw(), "source_group": group_id,
+        "created_at": now_tw(), "created_ts": time.time(), "source_group": group_id,
         "source_group_name": group_name(group_id),
         "updated_at": now_tw()
     }
@@ -652,19 +694,21 @@ button.active{background:#173e4a;color:white}.pill{font-size:11px;padding:6px 9p
 const key=new URLSearchParams(location.search).get("key")||"";let filter="all";
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 function cardReply(x){
- const done=x.status==="replied";
- const badge=done?'<span class="pill yes">✓ 已完成</span>':'<span class="pill wait">◷ 待處理</span>';
+ const done=x.status==="completed";
+ const replied=x.status==="replied";
+ const badge=done?'<span class="pill yes">✓ 已完成</span>':(replied?'<span class="pill wait">↩ 已回覆</span>':'<span class="pill wait">◷ 待處理</span>');
  const tools=done?`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:13px"><button data-retain="${esc(x.id)}" data-value="${x.retained?"false":"true"}">${x.retained?"★ 已保留（取消保留）":"☆ 保留紀錄"}</button><span class="muted" style="font-size:11px;align-self:center">${x.retained?"此紀錄不會自動刪除":"未保留：完成 14 天後自動刪除"}</span></div>`:"";
- return `<article class="card"><div class="head"><b>${esc(x.driver_name||"未知司機")}</b>${badge}</div><div class="info"><div class="muted">來源群組：${esc(x.source_group_name||"司機群組")}　${esc(x.created_at||"")}</div><div style="margin-top:8px"><b>司機回覆原文：</b><br>${esc(x.content||"（無內容）").replace(/\\n/g,"<br>")}</div>${x.fields?`<div style="margin-top:8px">🔎 自動辨識<br>${Object.entries(x.fields).filter(([k,v])=>v).map(([k,v])=>`${esc(k)}：<b>${esc(v)}</b>`).join("<br>")}</div>`:""}${done?`<div class="muted" style="margin-top:8px">完成時間：${esc(x.completed_at||"")}</div>`:""}${tools}</div></article>`;
+ const timeLabel=done?`完成時間：${esc(x.completed_at||"")}`:(replied?`回覆時間：${esc(x.replied_at||"")}`:"");
+ return `<article class="card"><div class="head"><b>${esc(x.driver_name||"未知司機")}</b>${badge}</div><div class="info"><div class="muted">來源群組：${esc(x.source_group_name||"司機群組")}　${esc(x.created_at||"")}</div><div style="margin-top:8px"><b>司機回覆原文：</b><br>${esc(x.content||"（無內容）").replace(/\n/g,"<br>")}</div>${x.fields?`<div style="margin-top:8px">🔎 自動辨識<br>${Object.entries(x.fields).filter(([k,v])=>v).map(([k,v])=>`${esc(k)}：<b>${esc(v)}</b>`).join("<br>")}</div>`:""}${timeLabel?`<div class="muted" style="margin-top:8px">${timeLabel}</div>`:""}${tools}</div></article>`;
 }
 function render(data){
  document.getElementById("dispatchCount").textContent=data.dispatches.length;
- document.getElementById("replyCount").textContent=data.shouts.filter(x=>x.status==="replied").length;
+ document.getElementById("replyCount").textContent=data.shouts.filter(x=>x.status==="replied"||x.status==="completed").length;
  document.getElementById("pendingCount").textContent=data.shouts.filter(x=>x.status==="pending").length;
- const list=data.shouts.filter(x=>filter==="all"||(filter==="replied"&&x.status==="replied")||(filter==="pending"&&x.status==="pending")||(filter==="completed"&&x.status==="replied"));
+ const list=data.shouts.filter(x=>filter==="all"||(filter==="replied"&&x.status==="replied")||(filter==="pending"&&x.status==="pending")||(filter==="completed"&&x.status==="completed"));
  document.getElementById("replies").innerHTML=list.length?list.map(cardReply).join(""):'<div class="empty">目前沒有符合條件的紀錄</div>';
  document.getElementById("completedTools").style.display=filter==="completed"?"flex":"none";
- document.getElementById("clearCompleted").disabled=!data.shouts.some(x=>x.status==="replied");
+ document.getElementById("clearCompleted").disabled=!data.shouts.some(x=>x.status==="completed");
  document.getElementById("dispatches").innerHTML=data.dispatches.length?data.dispatches.map(x=>`<article class="card"><div class="head"><b>派單 ${esc(x.id)}</b><span class="pill wait">進行中</span></div><div class="info">${esc(x.content).replace(/\\n/g,"<br>")}<div class="muted" style="margin-top:7px">${esc(x.created_at||"")}</div></div></article>`).join(""):'<div class="empty">目前沒有進行中的派單</div>';
  document.getElementById("updated").textContent="最後同步："+new Date().toLocaleTimeString("zh-TW",{hour12:false});
  document.getElementById("live").textContent="● 即時同步中";
@@ -683,7 +727,7 @@ document.getElementById("clearCompleted").addEventListener("click",async()=>{
  if(!confirm("確定清理全部已完成紀錄？包含已保留的紀錄也會一併刪除，無法復原。"))return;
  try{const r=await postAction("/api/dashboard/clear-completed",{});alert("已清理 "+r.deleted+" 筆完成紀錄。");await refresh()}catch(err){alert(err.message)}
 });
-async function refresh(){try{const r=await fetch("/api/dashboard?key="+encodeURIComponent(key),{cache:"no-store"});if(!r.ok)throw new Error(r.status===403?"看板密碼錯誤或未設定":"連線失敗（"+r.status+"）");render(await r.json())}catch(e){document.getElementById("live").textContent="● "+e.message;document.getElementById("live").style.background="#ffe5e5";document.getElementById("live").style.color="#9b2929"}}
+async function refresh(){const y=window.scrollY;try{const r=await fetch("/api/dashboard?key="+encodeURIComponent(key),{cache:"no-store"});if(!r.ok)throw new Error(r.status===403?"看板密碼錯誤或未設定":"連線失敗（"+r.status+"）");render(await r.json());window.scrollTo(0,y)}catch(e){document.getElementById("live").textContent="● "+e.message;document.getElementById("live").style.background="#ffe5e5";document.getElementById("live").style.color="#9b2929"}}
 document.querySelectorAll("[data-filter]").forEach(b=>b.addEventListener("click",()=>{filter=b.dataset.filter;document.querySelectorAll("[data-filter]").forEach(x=>x.classList.toggle("active",x===b));refresh()}));
 refresh();setInterval(refresh,5000);
 </script></body></html>"""
@@ -702,42 +746,91 @@ def dashboard_page():
     return DASHBOARD_HTML
 
 
-def cleanup_expired_completed_shouts():
-    """未保留的已完成喊單滿 14 天自動刪除；保留項目不自動刪除。"""
+def _order_timestamp(order, key, fallback_key="created_at"):
+    value = order.get(key)
+    if value is not None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            pass
+    stamp = order.get(fallback_key) or order.get("created_at")
+    try:
+        return datetime.strptime(stamp, "%Y/%m/%d %H:%M:%S").replace(
+            tzinfo=timezone(timedelta(hours=8))
+        ).timestamp()
+    except Exception:
+        return time.time()
+
+
+def cleanup_shout_lifecycle():
+    """待處理 48 小時刪除；已回覆 48 小時轉完成；未保留完成紀錄 14 天刪除。"""
     now = time.time()
-    cutoff = 14 * 24 * 60 * 60
     orders = S.get("orders", {})
     changed = False
-    deleted = 0
-
+    removed_pending = 0
+    removed_completed = 0
+    transitioned = 0
     for oid, order in list(orders.items()):
-        if order.get("kind") != "shout" or order.get("status") != "replied":
+        if order.get("kind") != "shout":
             continue
-        if order.get("retained", False):
-            continue
-
-        completed_ts = order.get("completed_at_ts")
-        if completed_ts is None:
-            stamp = order.get("updated_at") or order.get("created_at")
-            try:
-                completed_dt = datetime.strptime(stamp, "%Y/%m/%d %H:%M:%S").replace(
-                    tzinfo=timezone(timedelta(hours=8))
-                )
-                completed_ts = completed_dt.timestamp()
-            except Exception:
-                completed_ts = now
-            order["completed_at_ts"] = completed_ts
-            order.setdefault("completed_at", stamp or now_tw())
-            changed = True
-
-        if now - float(completed_ts) >= cutoff:
-            del orders[oid]
-            deleted += 1
-            changed = True
-
+        status = order.get("status")
+        if status == "pending":
+            created_ts = _order_timestamp(order, "created_ts")
+            order.setdefault("created_ts", created_ts)
+            if now - created_ts >= 48 * 60 * 60:
+                del orders[oid]
+                removed_pending += 1
+                changed = True
+                continue
+        elif status == "replied":
+            replied_ts = _order_timestamp(order, "replied_at_ts", "updated_at")
+            order.setdefault("replied_at_ts", replied_ts)
+            if now - replied_ts >= 48 * 60 * 60:
+                order["status"] = "completed"
+                order["completed_at_ts"] = now
+                order["completed_at"] = now_tw()
+                order["updated_at"] = now_tw()
+                transitioned += 1
+                changed = True
+        elif status == "completed":
+            if order.get("retained", False):
+                continue
+            completed_ts = _order_timestamp(order, "completed_at_ts", "updated_at")
+            order.setdefault("completed_at_ts", completed_ts)
+            if now - completed_ts >= 14 * 24 * 60 * 60:
+                del orders[oid]
+                removed_completed += 1
+                changed = True
     if changed:
         save()
-    return deleted
+    return {"pending_deleted": removed_pending, "completed_transitioned": transitioned,
+            "completed_deleted": removed_completed}
+
+
+def cleanup_expired_completed_shouts():
+    """舊函式名稱相容；統一執行喊單生命週期清理。"""
+    return cleanup_shout_lifecycle()["completed_deleted"]
+
+
+# 背景定期執行到期清理，不必等管理員打開看板或群組有人發言。
+def _cleanup_worker():
+    import threading
+    while True:
+        try:
+            cleanup_shout_lifecycle()
+        except Exception as e:
+            STATS["last_err"] = f"{now_tw()} cleanup: {err_text(e)}"
+            print("cleanup worker error:", err_text(e), flush=True)
+        threading.Event().wait(60)
+
+
+def start_cleanup_worker():
+    import threading
+    worker = threading.Thread(target=_cleanup_worker, name="carspeed-cleanup", daemon=True)
+    worker.start()
+
+
+start_cleanup_worker()
 
 
 @app.post("/api/dashboard/retain/<order_id>")
@@ -745,7 +838,7 @@ def dashboard_retain_shout(order_id):
     if not dashboard_authorized():
         abort(403)
     order = S.get("orders", {}).get(str(order_id))
-    if not order or order.get("kind") != "shout" or order.get("status") != "replied":
+    if not order or order.get("kind") != "shout" or order.get("status") != "completed":
         return jsonify({"ok": False, "error": "找不到已完成喊單"}), 404
     payload = request.get_json(silent=True) or {}
     order["retained"] = bool(payload.get("retained", True))
@@ -761,7 +854,7 @@ def dashboard_clear_completed():
     orders = S.get("orders", {})
     completed_ids = [
         oid for oid, order in orders.items()
-        if order.get("kind") == "shout" and order.get("status") == "replied"
+        if order.get("kind") == "shout" and order.get("status") == "completed"
     ]
     for oid in completed_ids:
         del orders[oid]
@@ -786,7 +879,7 @@ def dashboard_data():
                 "content": str(order.get("content", "")),
                 "created_at": order.get("created_at", ""),
             })
-        elif kind == "shout" and order.get("status") in ("pending", "replied"):
+        elif kind == "shout" and order.get("status") in ("pending", "replied", "completed"):
             raw = str(order.get("content", ""))
             # 看板與派單群「喊單列表」共用同一個來源群組名稱解析方式。
             # 舊資料若尚未保存名稱，依 shout 記錄中的 source_group 查詢 LINE 群組摘要，
@@ -805,15 +898,77 @@ def dashboard_data():
                 "content": raw,
                 "status": order.get("status"),
                 "created_at": order.get("created_at", ""),
-                "completed_at": order.get("completed_at", order.get("updated_at", "")),
+                "replied_at": order.get("replied_at", ""),
+                "completed_at": order.get("completed_at", ""),
                 "retained": bool(order.get("retained", False)),
                 "fields": extract_vehicle_fields(raw),
             })
 
+    def sort_key(item, key):
+        order = S.get("orders", {}).get(item["id"], {})
+        return _order_timestamp(order, key, "created_at")
+    shouts.sort(key=lambda x: (
+        _order_timestamp(S.get("orders", {}).get(x["id"], {}),
+                         "completed_at_ts" if x["status"] == "completed" else
+                         ("replied_at_ts" if x["status"] == "replied" else "created_ts"),
+                         "updated_at" if x["status"] != "pending" else "created_at")
+    ), reverse=True)
+    dispatches.sort(key=lambda x: S.get("orders", {}).get(x["id"], {}).get("created_ts", 0), reverse=True)
     return jsonify({
-        "dispatches": dispatches[-100:],
-        "shouts": shouts[-200:],
+        "dispatches": dispatches[:100],
+        "shouts": shouts[:200],
     })
+
+
+@handler.add(JoinEvent)
+def on_join(event):
+    """首次初始化：群組初始只有機器人與一位成員；以該群第一位回應者作本人確認對象。"""
+    try:
+        src = event.source
+        if isinstance(src, GroupSource) and not S.get("root_admin_id") and not S.get("bootstrap_initialized"):
+            if not S.get("bootstrap_group_id"):
+                S["bootstrap_group_id"] = src.group_id
+                S["bootstrap_candidate_user_id"] = None
+                save()
+            if src.group_id == S.get("bootstrap_group_id"):
+                reply(event.reply_token,
+                      "⚙️ CAR SPEED 首次初始化\n目前尚未設定最高管理員。\n請由本群唯一成員回覆任一訊息，機器人將向本人確認是否擔任最高管理員。\n確認指令：確認擔任最高管理員\n暫緩指令：暫不設定")
+    except Exception as e:
+        STATS["last_err"] = f"{now_tw()} {err_text(e)}"
+        print("join handler error:", err_text(e), flush=True)
+
+
+@handler.add(MemberLeftEvent)
+def on_member_left(event):
+    """派單員離開任一已綁定派單群組，即撤銷全系統派單員權限。"""
+    try:
+        src = event.source
+        if not isinstance(src, GroupSource) or src.group_id != S.get("dispatcher_group"):
+            return
+        left_members = getattr(getattr(event, "left", None), "members", []) or []
+        revoked_ids = []
+        for member in left_members:
+            uid = getattr(member, "user_id", None)
+            if not uid or not is_dispatcher(uid):
+                continue
+            S["dispatcher_users"] = [x for x in S.get("dispatcher_users", []) if x != uid]
+            S["admins"] = [x for x in S.get("admins", []) if x != uid]
+            record = {"user_id": uid, "group_id": src.group_id, "revoked_at": now_tw(),
+                      "reason": "left_bound_dispatcher_group"}
+            S.setdefault("permission_revocations", []).append(record)
+            S["permission_revocations"] = S["permission_revocations"][-500:]
+            revoked_ids.append(uid)
+        if revoked_ids:
+            save()
+            try:
+                reply(event.reply_token,
+                      "🔒 派單員離群權限異動：已撤銷以下成員全系統派單權限。\n" +
+                      "\n".join(revoked_ids))
+            except Exception:
+                pass
+    except Exception as e:
+        STATS["last_err"] = f"{now_tw()} {err_text(e)}"
+        print("member-left handler error:", err_text(e), flush=True)
 
 
 @handler.add(MessageEvent, message=TextMessageContent)
@@ -821,8 +976,13 @@ def on_message(event):
     try:
         src = event.source
         text = (event.message.text or "").strip()
+        cleanup_shout_lifecycle()
         if isinstance(src, GroupSource):
             if remember_message(getattr(event.message, "id", None)):
+                return
+            if (not S.get("root_admin_id") and not S.get("bootstrap_initialized")
+                    and src.group_id == S.get("bootstrap_group_id")):
+                handle_bootstrap_message(event, text, src)
                 return
             on_group(event, text, src)
         elif isinstance(src, UserSource):
@@ -832,33 +992,66 @@ def on_message(event):
         print("handler error:", err_text(e), flush=True)
 
 
+def handle_bootstrap_message(event, text, src):
+    """候選人由初始化群組第一位實際發言者建立，並由同一 LINE User ID 本人確認。"""
+    uid, tok = src.user_id, event.reply_token
+    candidate = S.get("bootstrap_candidate_user_id")
+    if not candidate:
+        S["bootstrap_candidate_user_id"] = uid
+        save()
+        if text == "確認擔任最高管理員":
+            confirm_initial_root(uid, tok)
+        elif text == "暫不設定":
+            reply(tok, "已暫緩初始化，尚未授予任何人最高管理員權限。之後由同一位成員回覆「確認擔任最高管理員」即可完成設定。")
+        else:
+            reply(tok, "🔐 最高管理員初始化確認\n請確認是否由你本人擔任唯一最高管理員。\n回覆：確認擔任最高管理員\n若暫不設定，回覆：暫不設定")
+        return
+    if uid != candidate:
+        return reply(tok, "目前初始化正在等待首次確認成員本人操作。")
+    if text == "確認擔任最高管理員":
+        return confirm_initial_root(uid, tok)
+    if text == "暫不設定":
+        return reply(tok, "已暫緩初始化，尚未授予任何人最高管理員權限。之後由同一位成員回覆「確認擔任最高管理員」即可完成設定。")
+    return reply(tok, "目前等待你本人確認。回覆「確認擔任最高管理員」或「暫不設定」。")
+
+
+def confirm_initial_root(uid, token):
+    if S.get("root_admin_id") or S.get("bootstrap_initialized"):
+        return reply(token, "系統已完成或已鎖定最高管理員初始化，不能重新設定。")
+    S["root_admin_id"] = uid
+    S["admin"] = uid
+    S["bootstrap_initialized"] = True
+    S["admins"] = list(dict.fromkeys(S.get("admins", []) + [uid]))
+    S["dispatcher_users"] = [x for x in S.get("dispatcher_users", []) if x != uid]
+    S["bootstrap_confirmed_at"] = now_tw()
+    save()
+    return reply(token, "✅ 最高管理員初始化完成。\n你已成為 CAR SPEED 唯一最高管理員。\n首次初始化入口已永久鎖定。\n請將機器人邀請至派單群組，再由你本人輸入「綁定派單群組」。")
+
+
 # ---------------- 司機群組 / 派單員群組 ----------------
 def on_group(event, text, src):
     uid, gid, tok = src.user_id, src.group_id, event.reply_token
 
-    # 兩個群組分開綁定；所有已授權管理員（包含主管理員）均可執行。
+    # 群組綁定只允許最高管理員；首次綁定命令是未綁定群組的唯一例外入口。
     if text in ("綁定司機群組", "綁定群組"):
-        if not is_admin(uid):
-            return reply(tok, "⛔ 只有已授權管理員可以綁定司機群組。")
+        if not is_root_admin(uid):
+            return reply(tok, "⛔ 只有最高管理員可以綁定司機群組。")
         S.setdefault("driver_groups", [])
         if gid not in S["driver_groups"]:
             S["driver_groups"].append(gid)
         if not S.get("driver_group"):
             S["driver_group"] = gid
         save()
-        return reply(
-            tok,
-            f"✅ 已加入【司機群組】綁定。\n目前共綁定 {len(get_driver_groups())} 個司機群組。\n此群組可正常喊單及接收系統通知。"
-        )
+        return reply(tok, f"✅ 已加入【司機群組】綁定。\n目前共綁定 {len(get_driver_groups())} 個司機群組。\n此群組可正常喊單及接收系統通知。")
 
     if text == "綁定派單群組":
-        if not is_admin(uid):
-            return reply(tok, "⛔ 只有已授權管理員可以綁定派單員群組。")
+        if not is_root_admin(uid):
+            return reply(tok, "⛔ 只有最高管理員可以綁定派單群組。")
         S["dispatcher_group"] = gid
         save()
-        return reply(tok, "✅ 已由管理員綁定為【派單員群組】。管理員可在此查看喊單及處理訂單。")
+        return reply(tok, "✅ 已由最高管理員綁定為【派單群組】。只有最高管理員及已指派派單員可在此操作。")
 
-    # 僅接受已綁定的兩個群組，其餘群組完全不處理。
+    # 只接受已綁定群組；派單群組內再執行人員角色驗證。
     if gid == S.get("dispatcher_group"):
         return on_dispatcher_group(event, text, src)
     if gid in get_driver_groups():
@@ -869,7 +1062,7 @@ def on_driver_group(event, text, src):
     tok, uid = event.reply_token, src.user_id
 
     if text in ("使用說明", "幫助", "help", "/help"):
-        return driver_group_reply(event, DRIVER_HELP)
+        return None  # 依規格：司機不提供 Help 功能
     if text in ("訂單列表", "可接訂單", "列表"):
         return driver_group_reply(event, active_order_list())
     if text in ("查看回覆", "我的回覆", "派單員回覆"):
@@ -890,33 +1083,108 @@ def on_driver_group(event, text, src):
 
 def on_dispatcher_group(event, text, src):
     tok, uid = event.reply_token, src.user_id
-    if not is_admin(uid):
-        # 非管理員在派單員群組不執行管理指令。
+    mentioned, rest = strip_self_mention(event.message)
+    cmd = (rest if mentioned else text).strip()
+    if cmd == "接受最高管理員":
+        pending = S.get("pending_root_transfer") or {}
+        if pending.get("to") != uid:
+            if not is_authorized_dispatcher(uid):
+                return
+            return reply(tok, "目前沒有指派給你的最高管理員轉讓申請。")
+        pending["accepted"] = True
+        pending["accepted_at"] = now_tw()
+        save()
+        return reply(tok, "已接受最高管理員轉讓，請原最高管理員輸入「確認轉讓最高管理員」完成最後確認。")
+
+    if not is_authorized_dispatcher(uid):
+        if text in ("使用說明", "幫助", "help", "/help"):
+            return reply(tok, BASIC_HELP)
         return
 
     mentioned, rest = strip_self_mention(event.message)
-    cmd = rest if mentioned else text
-    cmd = cmd.strip()
+    cmd = (rest if mentioned else text).strip()
+    target_ids = mentioned_user_ids(event.message)
 
     if cmd in ("使用說明", "幫助", "help", "/help"):
-        return reply(tok, DISPATCHER_HELP)
+        return reply(tok, help_for_user(uid))
+
+    # 最高管理員專屬管理及高風險指令
+    if is_root_admin(uid):
+        if cmd == "清理全部":
+            return reply(tok, clear_all_pending_shouts())
+        if cmd in ("訂單列表", "列表", "可接訂單"):
+            return reply(tok, active_order_list())
+        if cmd == "狀態":
+            return reply(tok, status_text())
+        if cmd.startswith("指派派單員"):
+            targets = [x for x in target_ids if x != uid and x != S.get("root_admin_id")]
+            if len(targets) != 1:
+                return reply(tok, "請使用 LINE 原生 @標註一位成員。格式：指派派單員 @人員")
+            target = targets[0]
+            if target in S.get("dispatcher_users", []):
+                return reply(tok, "該成員已經是派單員。")
+            S.setdefault("dispatcher_users", []).append(target)
+            if target not in S.setdefault("admins", []):
+                S["admins"].append(target)
+            save()
+            return reply(tok, f"✅ 已指派派單員。\nLINE User ID：{target}\n該成員可在本派單群組執行派單操作。")
+        if cmd.startswith("撤銷派單"):
+            targets = [x for x in target_ids if x != S.get("root_admin_id")]
+            if len(targets) != 1:
+                return reply(tok, "請使用 LINE 原生 @標註一位派單員。格式：撤銷派單 @人員")
+            target = targets[0]
+            if target not in S.get("dispatcher_users", []):
+                return reply(tok, "該成員目前不是已授權派單員。")
+            S["dispatcher_users"] = [x for x in S["dispatcher_users"] if x != target]
+            S["admins"] = [x for x in S.get("admins", []) if x != target]
+            S.setdefault("permission_revocations", []).append({"user_id": target, "group_id": S.get("dispatcher_group"), "revoked_at": now_tw(), "reason": "revoked_by_root_admin"})
+            S["permission_revocations"] = S["permission_revocations"][-500:]
+            save()
+            return reply(tok, f"🔒 已撤銷派單員權限。\nLINE User ID：{target}\n全系統派單權限立即失效。")
+        if cmd == "派單員列表":
+            users = S.get("dispatcher_users", [])
+            return reply(tok, "📋 目前派單員名單\n" + ("\n".join(f"{i+1}. {x}" for i, x in enumerate(users)) if users else "目前沒有已授權派單員。"))
+        if cmd in ("派單權限紀錄", "權限異動紀錄"):
+            records = S.get("permission_revocations", [])[-20:]
+            if not records:
+                return reply(tok, "目前沒有派單權限撤銷紀錄。")
+            lines = ["📋 最近 20 筆派單權限異動（最新在前）："]
+            for item in reversed(records):
+                reason = "離開派單群組自動撤銷" if item.get("reason") == "left_bound_dispatcher_group" else "最高管理員手動撤銷"
+                lines.append(f"\n時間：{item.get('revoked_at', '未知')}\nUser ID：{item.get('user_id', '未知')}\n群組：{item.get('group_id', '未知')}\n原因：{reason}")
+            return reply(tok, "\n".join(lines)[:4900])
+        if cmd.startswith("轉讓最高管理員"):
+            targets = [x for x in target_ids if x != uid]
+            if len(targets) != 1:
+                return reply(tok, "請使用 LINE 原生 @標註一位新任最高管理員。格式：轉讓最高管理員 @人員")
+            S["pending_root_transfer"] = {"from": uid, "to": targets[0], "accepted": False, "created_at": now_tw()}
+            save()
+            return reply(tok, f"已發起最高管理員轉讓。請新任人員本人在本派單群輸入「接受最高管理員」；接受後，再由你輸入「確認轉讓最高管理員」。\n目標 LINE User ID：{targets[0]}")
+        if cmd == "確認轉讓最高管理員":
+            pending = S.get("pending_root_transfer") or {}
+            if pending.get("from") != uid or not pending.get("accepted"):
+                return reply(tok, "目前沒有已由新任人員接受、等待你確認的轉讓申請。")
+            new_root = pending.get("to")
+            if not new_root:
+                return reply(tok, "轉讓資料不完整，已取消本次操作。")
+            if uid not in S.setdefault("dispatcher_users", []):
+                S["dispatcher_users"].append(uid)
+            S["root_admin_id"] = new_root
+            S["admin"] = new_root
+            S["admins"] = list(dict.fromkeys([x for x in S.get("admins", []) if x != uid] + [new_root]))
+            S["dispatcher_users"] = [x for x in S.get("dispatcher_users", []) if x != new_root]
+            S["pending_root_transfer"] = None
+            save()
+            return reply(tok, "✅ 最高管理員轉讓完成。\n新任最高管理員已取得完整管理權限。\n原最高管理員已降為一般派單員，仍可執行派單作業。")
+
+
+    # 一般派單員與最高管理員共同可用的營運指令
     if cmd in ("喊單列表", "待處理喊單", "喊單"):
         return reply(tok, dispatcher_shout_list())
-    if cmd == "清理全部":
-        return reply(tok, clear_all_pending_shouts())
-    if cmd in ("訂單列表", "列表", "可接訂單"):
-        return reply(tok, active_order_list())
-    if cmd == "狀態":
-        return reply(tok, status_text())
     if cmd == "取消":
         result = cancel_all_orders()
-        # 取消／公告屬於全體司機通知：每個已綁定司機群組各自排一份，
-        # 由該群組下一次訊息事件的 Reply Token 發送，不使用跨群 Push。
         for target_group_id in get_driver_groups():
-            queue_driver_notification(
-                "🪧 B.B.C 聯合公告：所有訂單已派出。",
-                target_group_id=target_group_id,
-            )
+            queue_driver_notification("🪧 B.B.C 聯合公告：所有訂單已派出。", target_group_id=target_group_id)
         return reply(tok, result + f"\n✅ 已分別加入 {len(get_driver_groups())} 個司機群組的待通知佇列；各群組下一次有人發言時以 Reply 通知。")
 
     m = re.match(r"^派單\s+(.+)$", cmd, re.S)
@@ -924,28 +1192,19 @@ def on_dispatcher_group(event, text, src):
         content = m.group(1).strip()
         oid = next_id()
         created_ts = time.time()
-        S["orders"][oid] = {
-            "kind": "dispatch", "status": "active", "content": content,
-            "created_at": now_tw(), "created_ts": created_ts,
-            "first_reply_after": created_ts + 5,
-            "first_reply_sent": False,
-            "created_by": uid
-        }
+        S["orders"][oid] = {"kind": "dispatch", "status": "active", "content": content,
+                            "created_at": now_tw(), "created_ts": created_ts,
+                            "first_reply_after": created_ts + 5, "first_reply_sent": False,
+                            "created_by": uid}
         save()
-        # 新派單不跨群組 Push：建立後 5 秒起，等司機群組下一次有人發言時
-        # 使用該事件的 Reply Token 做首次自動刷單；首次刷單後恢復每 30 秒被動 Reply。
         return reply(tok, f"✅ 訂單已建立 #{oid}\n{content}\n\n自動刷單：建立 5 秒後，司機群組有新訊息事件時首次 Reply 更新；之後每 {RESEND_INTERVAL} 秒，有新訊息事件時再 Reply 更新。")
 
-    # 回 @司機名稱 內容：依已登記的完整 LINE 顯示名稱比對，支援名稱內含空格。
     if cmd.startswith("回 "):
         payload = cmd[2:].strip()
         if payload.startswith(("@", "＠")):
             payload = payload[1:].lstrip()
-        matched_name = next(
-            (name for name in sorted(S.get("drivers", {}).keys(), key=len, reverse=True)
-             if payload.startswith(name + " ")),
-            None
-        )
+        matched_name = next((name for name in sorted(S.get("drivers", {}).keys(), key=len, reverse=True)
+                             if payload.startswith(name + " ")), None)
         if not matched_name:
             known = "、".join(S.get("drivers", {}).keys()) or "尚無已記錄司機"
             return reply(tok, f"找不到標示的司機，或名稱後缺少回覆內容。\n已記錄司機：{known}\n格式：回 @司機名稱 內容")
@@ -954,26 +1213,21 @@ def on_dispatcher_group(event, text, src):
             return reply(tok, "請輸入回覆內容。格式：回 @司機名稱 內容")
         driver_user_id = S.get("drivers", {}).get(matched_name)
         shout = next((o for _, o in reversed(list(S["orders"].items()))
-                      if o.get("kind") == "shout"
-                      and o.get("status") == "pending"
+                      if o.get("kind") == "shout" and o.get("status") == "pending"
                       and o.get("driver_user_id") == driver_user_id), None)
         if not shout:
             return reply(tok, f"找不到 {matched_name} 尚待處理的喊單。請先輸入「喊單列表」確認。")
         shout["status"] = "replied"
         shout["updated_at"] = now_tw()
-        shout["completed_at"] = now_tw()
-        shout["completed_at_ts"] = time.time()
+        shout["replied_at"] = now_tw()
+        shout["replied_at_ts"] = time.time()
         shout.setdefault("retained", False)
         shout["dispatcher_reply"] = message
         save()
-        queue_driver_notification(
-            f"派單員回覆：{message}",
-            driver_user_id=driver_user_id,
-            driver_name=matched_name,
-            quote_token=shout.get("quote_token"),
-            target_group_id=shout.get("source_group")
-        )
-        return reply(tok, f"✅ 已登記回覆 {matched_name}。\n司機群組下次只要有人發言，機器人就會引用原喊單並原生標註 {matched_name} 回覆；不需要該司機本人發言。")
+        queue_driver_notification(f"派單員回覆：{message}", driver_user_id=driver_user_id,
+                                  driver_name=matched_name, quote_token=shout.get("quote_token"),
+                                  target_group_id=shout.get("source_group"))
+        return reply(tok, f"✅ 已登記回覆 {matched_name}。\n該紀錄將保留在「已回覆」48 小時，之後自動轉入「已完成」。")
 
     m = re.match(r"^回司機\s+(.+?)\s+(.+)$", cmd, re.S)
     if m:
@@ -982,28 +1236,24 @@ def on_dispatcher_group(event, text, src):
             return reply(tok, f"尚未記錄司機「{driver_name}」。請確認司機曾在司機群組發言或喊單。")
         driver_user_id = S.get("drivers", {}).get(driver_name)
         shout = next((o for _, o in reversed(list(S["orders"].items()))
-                      if o.get("kind") == "shout"
-                      and o.get("status") == "pending"
+                      if o.get("kind") == "shout" and o.get("status") == "pending"
                       and o.get("driver_user_id") == driver_user_id), None)
         if not shout:
             return reply(tok, f"找不到 {driver_name} 尚待處理的喊單。請先輸入「喊單列表」確認。")
         shout["status"] = "replied"
         shout["updated_at"] = now_tw()
-        shout["completed_at"] = now_tw()
-        shout["completed_at_ts"] = time.time()
+        shout["replied_at"] = now_tw()
+        shout["replied_at_ts"] = time.time()
         shout.setdefault("retained", False)
         shout["dispatcher_reply"] = message
         save()
-        notice = f"派單員回覆：{message}"
-        queue_driver_notification(
-            notice,
-            driver_user_id=driver_user_id,
-            driver_name=driver_name,
-            quote_token=shout.get("quote_token"),
-            target_group_id=shout.get("source_group"),
-        )
-        return reply(tok, f"已將回覆排入 {driver_name} 原本喊單的司機群組；該群組下次有人發言時收到，不使用 Push。")
+        queue_driver_notification(f"派單員回覆：{message}", driver_user_id=driver_user_id,
+                                  driver_name=driver_name, quote_token=shout.get("quote_token"),
+                                  target_group_id=shout.get("source_group"))
+        return reply(tok, f"已將回覆排入 {driver_name} 原本喊單的司機群組。\n該紀錄將保留在「已回覆」48 小時，之後自動轉入「已完成」。")
 
+    if is_root_admin(uid):
+        return reply(tok, ROOT_HELP)
     return reply(tok, DISPATCHER_HELP)
 
 
@@ -1015,32 +1265,15 @@ def passive_remind(event):
 
 # ---------------- 私訊：管理員綁定 / 狀態 ----------------
 def on_private(event, text, src):
-    tok, uid = event.reply_token, src.user_id
-    if text.startswith("我是管理員"):
-        password = text.replace("我是管理員", "", 1).strip()
-        if password != ADMIN_PASSWORD:
-            return reply(tok, "密碼錯誤。")
-        if not S.get("admin"):
-            S["admin"] = uid
-        if uid not in S["admins"]:
-            S["admins"].append(uid)
-        save()
-        return reply(tok, "✅ 管理員權限已啟用。\n請將機器人加入兩個群組：\n1. 司機群組輸入：綁定司機群組\n2. 派單員群組輸入：綁定派單群組\n\n" + PRIVATE_HELP)
-
-    if not is_admin(uid):
-        return reply(tok, "此機器人僅限已授權管理員使用。")
-    if text == "狀態":
-        return reply(tok, status_text())
-    if text in ("幫助", "help", "/help"):
-        return reply(tok, PRIVATE_HELP)
-    return reply(tok, PRIVATE_HELP)
+    # 派單指令及管理指令只能在已綁定派單群組執行；私人聊天室不授權任何操作。
+    return reply(event.reply_token, "CAR SPEED 權限說明：管理及派單指令僅能在已綁定的派單群組內，由最高管理員或已授權派單員執行。")
 
 
 def status_text():
     return (
         "📊 CAR SPEED 系統狀態\n"
-        f"主管理員：{'已綁定' if S.get('admin') else '未綁定'}\n"
-        f"管理員人數：{len(S.get('admins', []))}\n"
+        f"最高管理員：{'已綁定' if S.get('root_admin_id') else '未初始化'}\n"
+        f"派單員人數：{len(S.get('dispatcher_users', []))}\n"
         f"司機群組：{len(get_driver_groups())} 個已綁定\n"
         f"派單員群組：{'已綁定' if S.get('dispatcher_group') else '未綁定'}\n"
         f"待處理喊單：{len(pending_shouts())} 筆\n"
@@ -1053,43 +1286,33 @@ def status_text():
     )
 
 
-# ---------------- 指令說明 ----------------
-DRIVER_HELP = (
-    "🚗 CAR SPEED｜司機群組指令\\n"
-    "【喊單】\\n"
-    "喊單 訂單內容／地點／時間 → 登記喊單（也可用：喊、+1）\\n"
-    "\\n【查詢】\\n"
-    "訂單列表 → 查看目前可接訂單\\n"
-    "\\n派單員回覆或通知會在你下一次於司機群組發言時，由機器人自動 Reply。"
+# ---------------- 角色分級指令說明 ----------------
+BASIC_HELP = (
+    "CAR SPEED 系統說明\n"
+    "本群不是已授權的派單操作入口。\n"
+    "派單操作僅限最高管理員或經授權派單員，在已綁定派單群組內執行。"
 )
 
 DISPATCHER_HELP = (
-    "🧑‍💼 CAR SPEED｜派單員群組指令\\n"
-    "【一、喊單處理】\\n"
-    "喊單列表 → 查看司機待處理喊單（顯示來源群組名稱）\\n"
-    "清理全部 → 清除所有待處理喊單\\n"
-    "回 @司機名稱 內容 → 引用該司機最新喊單並回覆\\n"
-    "\\n【二、派單管理】\\n"
-    "派單 訂單內容 → 新增可接訂單\\n"
-    "訂單列表 → 查看目前進行中的訂單\\n"
-    "取消 → 結束全部進行中派單並公告\\n"
-    "\\n【三、系統查詢】\\n"
-    "狀態 → 查看系統狀態\\n"
-    "/help／使用說明 → 顯示本指令列表\\n"
-    "\\n注意：喊單列表不顯示喊單編號；派單員回覆會引用原始喊單，普通派單內容則獨立發送。"
+    "🧑‍💼 CAR SPEED｜派單員指令\n"
+    "派單 訂單內容 → 新增可接訂單\n"
+    "取消 → 結束全部進行中派單並公告\n"
+    "喊單列表 → 查看司機待處理喊單\n"
+    "回 @司機名稱 內容 → 回覆該司機最新喊單\n"
+    "/help → 查看派單員指令"
 )
 
-PRIVATE_HELP = (
-    "⚙️ CAR SPEED｜管理員私訊指令\\n"
-    "【系統】\\n"
-    "狀態 → 查看雙群組綁定及系統狀態\\n"
-    "/help／幫助 → 查看管理員使用說明\\n"
-    "\\n【群組綁定】（所有已授權管理員皆可）\\n"
-    "每個司機群組分別輸入：綁定司機群組（可重複綁定多個群組）\\n"
-    "在派單員群組輸入：綁定派單群組\\n"
-    "\\n【新增管理員】\\n"
-    "私訊機器人輸入：我是管理員 密碼"
+ROOT_HELP = (
+    "👑 CAR SPEED｜最高管理員完整指令\n\n"
+    "【派單操作】\n派單 訂單內容\n取消\n喊單列表\n回 @司機名稱 內容\n訂單列表\n清理全部\n狀態\n\n"
+    "【人員管理】\n指派派單員 @人員\n撤銷派單 @人員\n派單員列表\n派單權限紀錄\n\n"
+    "【群組管理】\n綁定派單群組\n綁定司機群組\n\n"
+    "【最高管理員】\n轉讓最高管理員 @人員\n接受最高管理員（新任人員）\n確認轉讓最高管理員（現任最高管理員）\n\n"
+    "/help → 顯示最高管理員完整指令"
 )
+
+PRIVATE_HELP = BASIC_HELP
+
 
 # ---------------- 標註解析 ----------------
 def strip_self_mention(message):
