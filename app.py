@@ -22,8 +22,8 @@ from linebot.v3.webhooks import (MessageEvent, TextMessageContent, GroupSource, 
                                  JoinEvent, MemberLeftEvent, LeaveEvent)
 
 # ============================================================
-# CAR SPEED v3.8.0｜LINE Login 管理後台雙向同步版
-# CAR SPEED 雙群組版
+# 黑貓B.B.C v3.9.0｜LINE Login 管理後台雙向同步版
+# 黑貓B.B.C 雙群組版
 # 司機群組：司機喊單、接收派單／指定司機／取消通知
 # 派單員群組：管理員查看喊單、發布訂單、指定司機及管理訂單
 # 派單員指定司機／回覆／取消：先寫入待通知佇列，不使用 Push API。
@@ -134,6 +134,23 @@ def group_record(group_id):
 def active_driver_groups():
     return [x.get("group_id") for x in S.get("driver_group_records", [])
             if isinstance(x, dict) and x.get("status") == "approved" and x.get("group_id")]
+
+
+def driver_group_rows(status=None):
+    rows = [x for x in S.get("driver_group_records", []) if isinstance(x, dict)]
+    return [x for x in rows if x.get("status") == status] if status else rows
+
+
+def resolve_driver_group_ref(value, status=None):
+    value = str(value or "").strip()
+    if not value.isdigit(): return None
+    rows = driver_group_rows(status)
+    index = int(value) - 1
+    return rows[index].get("group_id") if 0 <= index < len(rows) else None
+
+
+def group_status_label(status):
+    return {"approved":"使用中","pending":"待審核","rejected":"已拒絕","unbound":"已解除綁定"}.get(status, str(status or "未知"))
 
 
 S = load()
@@ -713,6 +730,38 @@ def get_driver_name(group_id, user_id):
     return name
 
 
+def get_line_user_display_name(user_id):
+    """取得派單員 LINE 顯示名稱；快取資料，避免看板每 5 秒重複呼叫 LINE API。"""
+    uid = str(user_id or "").strip()
+    if not uid:
+        return "未知使用者"
+    cache = S.setdefault("dispatcher_profiles", {})
+    cached = cache.get(uid) or {}
+    checked_at = float(cached.get("checked_at", 0) or 0)
+    if cached.get("display_name") and time.time() - checked_at < 86400:
+        return cached["display_name"]
+    display_name = ""
+    try:
+        with ApiClient(config) as c:
+            profile = MessagingApi(c).get_profile(uid)
+            display_name = str(getattr(profile, "display_name", "") or "").strip()
+    except Exception:
+        # 若使用者仍在已綁定派單群組，嘗試從群組成員資料取得名稱。
+        gid = S.get("dispatcher_group")
+        if gid:
+            try:
+                with ApiClient(config) as c:
+                    profile = MessagingApi(c).get_group_member_profile(gid, uid)
+                    display_name = str(getattr(profile, "display_name", "") or "").strip()
+            except Exception:
+                pass
+    if display_name:
+        cache[uid] = {"display_name": display_name, "checked_at": time.time()}
+        save()
+        return display_name
+    return str(cached.get("display_name") or "（無法取得名稱）")
+
+
 def record_shout(event, group_id, user_id, content):
     name = get_driver_name(group_id, user_id)
     oid = next_id()
@@ -743,7 +792,7 @@ def callback():
 
 @app.get("/")
 def health():
-    return "CAR SPEED v3.8.0 dual-group bot is running"
+    return "黑貓B.B.C v3.9.0 dual-group bot is running"
 
 
 # ---------------- LIFF / 網頁即時派單看板 ----------------
@@ -753,7 +802,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <html lang="zh-Hant"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#102b36">
-<title>CAR SPEED｜派單即時看板</title>
+<title>黑貓B.B.C｜派單即時看板</title>
 <style>
 *{box-sizing:border-box}body{margin:0;background:#f2f5f6;color:#203238;font-family:-apple-system,BlinkMacSystemFont,"Noto Sans TC",sans-serif}
 .app{max-width:760px;margin:auto;padding:14px}header{background:linear-gradient(135deg,#102b36,#245363);color:white;padding:21px;border-radius:19px}
@@ -770,7 +819,7 @@ button.active{background:#173e4a;color:white}.pill{font-size:11px;padding:6px 9p
 .foot{text-align:center;color:#89969a;font-size:11px;padding:22px 0}
 @media(max-width:400px){.app{padding:10px}.stat{padding:10px}.num{font-size:23px}}
 </style></head><body><main class="app">
-<header><div class="brand"><b>🚘</b> CAR SPEED</div><h1>派單即時看板</h1>
+<header><div class="brand"><b>🚘</b> 黑貓B.B.C</div><h1>派單即時看板</h1>
 <div class="sub">司機喊單與回覆同步｜派單人員專用</div><span class="live" id="live">● 正在連線</span><button id="relogin" type="button" style="display:none;margin-top:10px" onclick="reloginLine()">重新登入 LINE</button>
 <div class="sub" id="updated" style="margin-top:9px">資料載入中…</div></header>
 <section class="stats">
@@ -788,7 +837,7 @@ button.active{background:#173e4a;color:white}.pill{font-size:11px;padding:6px 9p
 <article class="card"><div class="head"><b>派單員管理</b><span class="muted">以 LINE User ID 授權</span></div><div style="display:flex;gap:8px;margin-top:10px"><input id="dispatcherUid" placeholder="輸入已驗證的 LINE User ID" style="min-width:0;flex:1;padding:10px;border:1px solid #d8e1e4;border-radius:10px"><button id="assignDispatcher">指派</button><button id="revokeDispatcher">撤銷</button></div><div id="dispatcherList" class="info"></div></article>
 <article class="card"><div class="head"><b>司機群組管理</b><span class="muted">LINE／網頁共用資料</span></div><div id="groupList" class="info">載入中…</div></article>
 <article class="card"><b>最近管理操作紀錄</b><div id="adminAudit" class="info">載入中…</div></article></section>
-<div class="foot">CAR SPEED｜LINE 身分驗證｜頁面每 5 秒自動同步</div>
+<div class="foot">黑貓B.B.C｜LINE 身分驗證｜頁面每 5 秒自動同步</div>
 </main><script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script><script>
 const LIFF_ID=__LIFF_ID_JSON__;let filter="all";let currentRole=null;
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -831,11 +880,11 @@ function showDashboardError(message,auth=false){const el=document.getElementById
 async function refresh(){if(refreshBusy)return;refreshBusy=true;const y=window.scrollY;try{const r=await fetch("/api/dashboard",{cache:"no-store",credentials:"same-origin"});if(!r.ok){if(r.status===401||r.status===403)showDashboardError("登入或權限已失效，請重新登入",true);else showDashboardError("資料同步失敗（"+r.status+"）");return}render(await r.json());window.scrollTo(0,y)}catch(e){showDashboardError(e.message)}finally{refreshBusy=false}}
 document.querySelectorAll("[data-filter]").forEach(b=>b.addEventListener("click",()=>{filter=b.dataset.filter;document.querySelectorAll("[data-filter]").forEach(x=>x.classList.toggle("active",x===b));refresh()}));
 async function adminPost(path,payload){const r=await fetch(path,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});const x=await r.json().catch(()=>({}));if(!r.ok||!x.ok)throw new Error(x.error||"管理操作失敗");return x}
-async function loadAdmin(){if(currentRole!=="root_admin"||adminBusy)return;adminBusy=true;try{const r=await fetch("/api/admin/overview",{cache:"no-store",credentials:"same-origin"});if(!r.ok)throw new Error("管理資料讀取失敗");const d=await r.json();document.getElementById("adminDispatcherCount").textContent=d.dispatchers.length;document.getElementById("adminGroupCount").textContent=d.groups.filter(x=>x.status==="approved").length;document.getElementById("adminPendingCount").textContent=d.pending_count;document.getElementById("dispatcherList").innerHTML=d.dispatchers.length?d.dispatchers.map(x=>`<div style="padding:7px 0;border-bottom:1px solid #edf0f1">${esc(x)}</div>`).join(""):"目前沒有派單員";const names={approved:"使用中",pending:"待審核",rejected:"已拒絕",unbound:"已解除綁定"};document.getElementById("groupList").innerHTML=d.groups.length?d.groups.map(g=>`<div style="padding:10px 0;border-bottom:1px solid #edf0f1"><b>${esc(g.group_name||"司機群組")}</b> <span class="pill ${g.status==="approved"?"yes":"wait"}">${names[g.status]||esc(g.status)}</span><div class="muted" style="font-size:10px;word-break:break-all">${esc(g.group_id)}</div>${g.status==="pending"?`<button data-group-action="approve" data-gid="${esc(g.group_id)}">核准</button> <button data-group-action="reject" data-gid="${esc(g.group_id)}">拒絕</button>`:g.status==="approved"?`<button data-group-action="unbind" data-gid="${esc(g.group_id)}">解除綁定</button>`:""}</div>`).join(""):"目前沒有群組紀錄";document.getElementById("adminAudit").innerHTML=d.audit.length?d.audit.map(a=>`<div style="padding:6px 0;border-bottom:1px solid #edf0f1">${esc(a.created_at)}｜${esc(a.action)}｜${esc(a.target_id)}｜${esc(a.result)}</div>`).join(""):"尚無管理操作紀錄"}finally{adminBusy=false}}
+async function loadAdmin(){if(currentRole!=="root_admin"||adminBusy)return;adminBusy=true;try{const r=await fetch("/api/admin/overview",{cache:"no-store",credentials:"same-origin"});if(!r.ok)throw new Error("管理資料讀取失敗");const d=await r.json();document.getElementById("adminDispatcherCount").textContent=d.dispatchers.length;document.getElementById("adminGroupCount").textContent=d.groups.filter(x=>x.status==="approved").length;document.getElementById("adminPendingCount").textContent=d.pending_count;document.getElementById("dispatcherList").innerHTML=d.dispatchers.length?d.dispatchers.map(x=>`<div style="padding:7px 0;border-bottom:1px solid #edf0f1"><b>${esc(x.display_name||"（無法取得名稱）")}</b><div class="muted" style="font-size:11px;word-break:break-all">LINE ID：${esc(x.user_id)}</div></div>`).join(""):"目前沒有派單員";const names={approved:"使用中",pending:"待審核",rejected:"已拒絕",unbound:"已解除綁定"};document.getElementById("groupList").innerHTML=d.groups.length?d.groups.map(g=>`<div style="padding:10px 0;border-bottom:1px solid #edf0f1"><b>${esc(g.group_name||"司機群組")}</b> <span class="pill ${g.status==="approved"?"yes":"wait"}">${names[g.status]||esc(g.status)}</span><div class="muted" style="font-size:10px;word-break:break-all">${esc(g.group_ref)}</div>${g.status==="pending"?`<button data-group-action="approve" data-gref="${esc(g.group_ref)}">核准</button> <button data-group-action="reject" data-gref="${esc(g.group_ref)}">拒絕</button>`:g.status==="approved"?`<button data-group-action="unbind" data-gref="${esc(g.group_ref)}">解除綁定</button>`:""}</div>`).join(""):"目前沒有群組紀錄";document.getElementById("adminAudit").innerHTML=d.audit.length?d.audit.map(a=>`<div style="padding:6px 0;border-bottom:1px solid #edf0f1">${esc(a.created_at)}｜${esc(a.action)}｜${esc(a.target_id)}｜${esc(a.result)}</div>`).join(""):"尚無管理操作紀錄"}finally{adminBusy=false}}
 document.getElementById("assignDispatcher").addEventListener("click",async()=>{const user_id=document.getElementById("dispatcherUid").value.trim();if(!user_id)return alert("請輸入 LINE User ID");if(!confirm("確定指派此 LINE User ID 為派單員？"))return;try{await adminPost("/api/admin/dispatcher",{action:"assign",user_id});alert("派單員指派成功");document.getElementById("dispatcherUid").value="";await loadAdmin()}catch(e){alert(e.message)}});
 document.getElementById("revokeDispatcher").addEventListener("click",async()=>{const user_id=document.getElementById("dispatcherUid").value.trim();if(!user_id)return alert("請輸入要撤銷的 LINE User ID");if(!confirm("確定撤銷此派單員的全系統權限？"))return;try{await adminPost("/api/admin/dispatcher",{action:"revoke",user_id});alert("派單員權限已撤銷");document.getElementById("dispatcherUid").value="";await loadAdmin()}catch(e){alert(e.message)}});
 document.getElementById("revokeDispatcher").addEventListener("click",async()=>{const user_id=document.getElementById("dispatcherUid").value.trim();if(!user_id)return alert("請輸入 LINE User ID");if(!confirm("確定撤銷此派單員權限？"))return;try{await adminPost("/api/admin/dispatcher",{action:"revoke",user_id});alert("派單員權限已撤銷");document.getElementById("dispatcherUid").value="";await loadAdmin()}catch(e){alert(e.message)}});
-document.getElementById("groupList").addEventListener("click",async e=>{const b=e.target.closest("[data-group-action]");if(!b)return;const action=b.dataset.groupAction,group_id=b.dataset.gid;if(!confirm("確定執行「"+action+"」？"))return;try{await adminPost("/api/admin/driver-group",{action,group_id});await loadAdmin()}catch(err){alert(err.message)}});
+document.getElementById("groupList").addEventListener("click",async e=>{const b=e.target.closest("[data-group-action]");if(!b)return;const action=b.dataset.groupAction,group_ref=b.dataset.gref;if(!confirm("確定執行「"+action+"」？"))return;try{await adminPost("/api/admin/driver-group",{action,group_ref});await loadAdmin()}catch(err){alert(err.message)}});
 async function reloginLine(){
  try{document.getElementById("relogin").style.display="none";if(!window.liff)throw new Error("LINE LIFF SDK 尚未載入");if(liff.isLoggedIn())liff.logout();liff.login({redirectUri:location.href})}
  catch(e){showDashboardError("重新登入失敗："+e.message,true)}
@@ -901,7 +950,7 @@ def dashboard_line_login():
     role="root_admin" if uid==S.get("root_admin_id") else ("dispatcher" if uid in S.get("dispatcher_users",[]) else None)
     if not role:
         session.clear()
-        return jsonify({"ok":False,"error":"此 LINE 帳號尚未取得 CAR SPEED 看板權限"}),403
+        return jsonify({"ok":False,"error":"此 LINE 帳號尚未取得 黑貓B.B.C 看板權限"}),403
     session.clear();session.permanent=True
     session["line_user_id"]=uid
     return jsonify({"ok":True,"role":role})
@@ -1118,13 +1167,13 @@ def on_join(event):
                 save()
             if gid == S.get("bootstrap_group_id"):
                 reply(event.reply_token,
-                      "⚙️ CAR SPEED 首次初始化\n目前尚未設定最高管理員。\n請由本群唯一成員回覆任一訊息，機器人將向本人確認是否擔任最高管理員。\n確認指令：確認擔任最高管理員\n暫緩指令：暫不設定")
+                      "⚙️ 黑貓B.B.C 首次初始化\n目前尚未設定最高管理員。\n請由本群唯一成員回覆任一訊息，機器人將向本人確認是否擔任最高管理員。\n確認指令：確認擔任最高管理員\n暫緩指令：暫不設定")
                 return
         result = register_joined_driver_group(gid)
         if result == "pending":
-            reply(event.reply_token, "🚘 CAR SPEED 已自動取得本群 Group ID，並建立待審核申請。\n請等待最高管理員於網頁後台核准；核准前無法喊單或接收派單。")
+            reply(event.reply_token, "🚘 黑貓B.B.C 已自動取得本群 Group ID，並建立待審核申請。\n請等待最高管理員於網頁後台核准；核准前無法喊單或接收派單。")
         elif result == "approved":
-            reply(event.reply_token, "✅ CAR SPEED 已確認本群為核准中的司機群組。")
+            reply(event.reply_token, "✅ 黑貓B.B.C 已確認本群為核准中的司機群組。")
     except Exception as e:
         STATS["last_err"] = f"{now_tw()} {err_text(e)}"
         print("join handler error:", err_text(e), flush=True)
@@ -1230,10 +1279,10 @@ def confirm_initial_root(uid, token):
     S["dispatcher_users"] = [x for x in S.get("dispatcher_users", []) if x != uid]
     S["bootstrap_confirmed_at"] = now_tw()
     save()
-    return reply(token, "✅ 最高管理員初始化完成。\n你已成為 CAR SPEED 唯一最高管理員。\n首次初始化入口已永久鎖定。\n請將機器人邀請至派單群組，再由你本人輸入「綁定派單群組」。")
+    return reply(token, "✅ 最高管理員初始化完成。\n你已成為 黑貓B.B.C 唯一最高管理員。\n首次初始化入口已永久鎖定。\n請將機器人邀請至派單群組，再由你本人輸入「綁定派單群組」。")
 
 
-# ---------------- v3.8.0 群組申請與審核 ----------------
+# ---------------- v3.9.0 群組申請與審核 ----------------
 def request_driver_group(event, src):
     gid, uid = src.group_id, src.user_id
     rec = group_record(gid)
@@ -1256,48 +1305,59 @@ def request_driver_group(event, src):
 
 
 def approve_driver_group(gid, actor="LINE群組操作"):
-    rec = group_record(gid)
-    if not rec:
-        return False, "找不到群組申請"
-    rec.update({"status": "approved", "approved_at": now_tw(), "approved_by": actor})
-    if gid not in S.setdefault("driver_groups", []): S["driver_groups"].append(gid)
-    if not S.get("driver_group"): S["driver_group"] = gid
-    S["pending_driver_group_requests"] = [x for x in S.get("pending_driver_group_requests", []) if x.get("group_id") != gid]
-    audit_admin("approve_driver_group", "driver_group", gid)
-    save(); return True, "已核准群組"
+    rec=group_record(gid)
+    if not rec: return False,"找不到群組申請"
+    name=rec.get("group_name") or "司機群組"
+    if rec.get("status")=="approved": return True,f"此群組已經核准。\\n群組名稱：{name}\\n審核結果：已核准"
+    if rec.get("status")!="pending": return False,f"此群組目前狀態為「{group_status_label(rec.get('status'))}」，請等待重新申請。"
+    rec.update({"status":"approved","approved_at":now_tw(),"approved_by":actor})
+    if gid not in S.setdefault("driver_groups",[]): S["driver_groups"].append(gid)
+    if not S.get("driver_group"): S["driver_group"]=gid
+    S["pending_driver_group_requests"]=[x for x in S.get("pending_driver_group_requests",[]) if x.get("group_id")!=gid]
+    audit_admin("approve_driver_group","driver_group",gid); save()
+    return True,f"✅ 司機群組審核完成\\n群組名稱：{name}\\n審核結果：已核准\\n該群組現在可以正常喊單及接收派單。"
 
 
 def reject_driver_group(gid, actor="LINE群組操作"):
-    rec = group_record(gid)
-    if not rec: return False, "找不到群組申請"
-    rec.update({"status": "rejected", "rejected_at": now_tw(), "rejected_by": actor})
-    S["driver_groups"] = [x for x in S.get("driver_groups", []) if x != gid]
-    S["pending_driver_group_requests"] = [x for x in S.get("pending_driver_group_requests", []) if x.get("group_id") != gid]
-    audit_admin("reject_driver_group", "driver_group", gid)
-    save(); return True, "已拒絕群組申請"
+    rec=group_record(gid)
+    if not rec: return False,"找不到群組申請"
+    name=rec.get("group_name") or "司機群組"
+    if rec.get("status")=="rejected": return True,f"此群組已經拒絕。\\n群組名稱：{name}\\n目前狀態：已拒絕"
+    if rec.get("status")!="pending": return False,f"此群組目前狀態為「{group_status_label(rec.get('status'))}」，不能拒絕。"
+    rec.update({"status":"rejected","rejected_at":now_tw(),"rejected_by":actor})
+    S["driver_groups"]=[x for x in S.get("driver_groups",[]) if x!=gid]
+    S["pending_driver_group_requests"]=[x for x in S.get("pending_driver_group_requests",[]) if x.get("group_id")!=gid]
+    audit_admin("reject_driver_group","driver_group",gid); save()
+    return True,f"司機群組審核完成\\n群組名稱：{name}\\n審核結果：已拒絕"
 
 
 def unbind_driver_group(gid, reason="manual", actor="system"):
-    rec = group_record(gid)
-    if not rec:
-        rec = {"group_id": gid, "group_name": "司機群組", "created_at": now_tw()}
-        S.setdefault("driver_group_records", []).append(rec)
-    rec.update({"status": "unbound", "unbound_at": now_tw(), "unbind_reason": reason, "unbound_by": actor})
-    S["driver_groups"] = [x for x in S.get("driver_groups", []) if x != gid]
-    if S.get("driver_group") == gid:
-        S["driver_group"] = S["driver_groups"][0] if S["driver_groups"] else None
-    audit_admin("unbind_driver_group", "driver_group", gid, detail=reason)
-    save()
+    rec=group_record(gid)
+    if not rec: return False,"找不到群組紀錄"
+    name=rec.get("group_name") or "司機群組"
+    if rec.get("status")=="unbound": return True,f"此群組已解除綁定。\\n群組名稱：{name}\\n目前狀態：已解除綁定"
+    if rec.get("status")!="approved": return False,f"此群組目前狀態為「{group_status_label(rec.get('status'))}」，無需解除。"
+    rec.update({"status":"unbound","unbound_at":now_tw(),"unbind_reason":reason,"unbound_by":actor})
+    S["driver_groups"]=[x for x in S.get("driver_groups",[]) if x!=gid]
+    if S.get("driver_group")==gid: S["driver_group"]=S["driver_groups"][0] if S["driver_groups"] else None
+    audit_admin("unbind_driver_group","driver_group",gid,detail=reason); save()
+    return True,("⚠️ 司機群組已解除綁定\\n" f"群組名稱：{name}\\n目前狀態：已解除綁定\\n"
+                 "請將黑貓B.B.C 機器人從該群組移除，再重新邀請加入。\\n"
+                 "重新加入後會自動建立待審核申請，必須經最高管理員核准才能恢復使用。")
 
 
 @app.get("/api/admin/overview")
 def admin_overview():
-    if _current_dashboard_role() != "root_admin": abort(403)
+    if _current_dashboard_role()!="root_admin": abort(403)
     refresh_group_names()
-    groups = [x for x in S.get("driver_group_records", []) if isinstance(x, dict)]
-    return jsonify({"ok": True, "dispatchers": S.get("dispatcher_users", []),
-        "groups": groups, "pending_count": sum(1 for x in groups if x.get("status") == "pending"),
-        "audit": list(reversed(S.get("admin_audit_log", [])[-100:]))})
+    groups=[{"group_ref":str(i),"group_name":x.get("group_name") or "司機群組",
+             "status":x.get("status"),"created_at":x.get("created_at"),"approved_at":x.get("approved_at")}
+            for i,x in enumerate(driver_group_rows(),1)]
+    dispatchers = [{"user_id": uid, "display_name": get_line_user_display_name(uid)}
+                  for uid in S.get("dispatcher_users", [])]
+    return jsonify({"ok":True,"dispatchers":dispatchers,"groups":groups,
+        "pending_count":sum(1 for x in groups if x.get("status")=="pending"),
+        "audit":list(reversed(S.get("admin_audit_log",[])[-100:]))})
 
 
 @app.post("/api/admin/dispatcher")
@@ -1321,17 +1381,17 @@ def admin_dispatcher_change():
 
 @app.post("/api/admin/driver-group")
 def admin_driver_group_change():
-    if _current_dashboard_role() != "root_admin": abort(403)
-    data = request.get_json(silent=True) or {}; gid = str(data.get("group_id", "")).strip(); action = data.get("action")
-    if not gid: return jsonify({"ok": False, "error": "缺少群組 ID"}), 400
-    if action == "approve": ok, msg = approve_driver_group(gid, session.get("line_user_id"))
-    elif action == "reject": ok, msg = reject_driver_group(gid, session.get("line_user_id"))
-    elif action == "unbind":
-        if gid not in get_driver_groups(): return jsonify({"ok": False, "error": "群組目前未綁定"}), 404
-        unbind_driver_group(gid, "manual_by_root_admin_web", session.get("line_user_id")); ok, msg = True, "已解除綁定"
-    else: return jsonify({"ok": False, "error": "未知操作"}), 400
-    if not ok: return jsonify({"ok": False, "error": msg}), 404
-    return jsonify({"ok": True, "message": msg})
+    if _current_dashboard_role()!="root_admin": abort(403)
+    data=request.get_json(silent=True) or {}; action=data.get("action")
+    gid=resolve_driver_group_ref(data.get("group_ref"))
+    if not gid: return jsonify({"ok":False,"error":"群組資料已更新，請重新整理後再操作"}),404
+    if action=="approve": ok,msg=approve_driver_group(gid,session.get("line_user_id"))
+    elif action=="reject": ok,msg=reject_driver_group(gid,session.get("line_user_id"))
+    elif action=="unbind": ok,msg=unbind_driver_group(gid,"manual_by_root_admin_web",session.get("line_user_id"))
+    else: return jsonify({"ok":False,"error":"未知操作"}),400
+    if not ok: return jsonify({"ok":False,"error":msg}),409
+    return jsonify({"ok":True,"message":msg,
+        "line_notice":"網頁操作不會即時推播 LINE；符合省額度模式，需等待群組下一次訊息事件才能使用 Reply 通知。"})
 
 
 # ---------------- 司機群組 / 派單員群組 ----------------
@@ -1409,22 +1469,32 @@ def on_dispatcher_group(event, text, src):
 
     if cmd in ("使用說明", "幫助", "help", "/help"):
         return reply(tok, help_for_user(uid))
+    if cmd=="即時看板":
+        return reply(tok,"📊 黑貓B.B.C 即時管理看板\\nhttps://botline-6jwy.onrender.com/dashboard")
+
+    if cmd=="司機群組列表":
+        rows=driver_group_rows()
+        lines=[f"{i+1}. {x.get('group_name') or '司機群組'}｜{group_status_label(x.get('status'))}" for i,x in enumerate(rows)]
+        return reply(tok,"📋 司機群組列表（核准／解除請使用此清單編號）\\n"+("\\n".join(lines) if lines else "目前沒有群組紀錄。"))
+    if cmd=="待審核司機群組":
+        rows=driver_group_rows("pending")
+        lines=[f"{i+1}. {x.get('group_name') or '司機群組'}｜待審核" for i,x in enumerate(rows)]
+        return reply(tok,"📋 待審核司機群組（核准／拒絕請使用此清單編號）\\n"+("\\n".join(lines) if lines else "目前沒有待審核群組。"))
 
     # 最高管理員專屬管理及高風險指令
     if is_root_admin(uid):
-        if cmd in ("司機群組列表", "群組列表"):
-            rows = S.get("driver_group_records", [])
-            label = {"approved":"使用中", "pending":"待審核", "rejected":"已拒絕", "unbound":"已解除綁定"}
-            lines = [f"{i+1}. {x.get('group_name','司機群組')}｜{label.get(x.get('status'), x.get('status'))}｜{x.get('group_id')}" for i,x in enumerate(rows)]
-            return reply(tok, "📋 司機群組管理\n" + ("\n".join(lines) if lines else "目前沒有群組紀錄。"))
         if cmd.startswith("核准司機群組 "):
-            gid = cmd.split(" ",1)[1].strip(); ok,msg = approve_driver_group(gid, uid); return reply(tok, ("✅ " if ok else "⛔ ")+msg)
+            gid=resolve_driver_group_ref(cmd.split(" ",1)[1],"pending")
+            if not gid:return reply(tok,"找不到該編號；請先輸入「待審核司機群組」重新確認。")
+            ok,msg=approve_driver_group(gid,uid); return reply(tok,msg if ok else "⛔ "+msg)
         if cmd.startswith("拒絕司機群組 "):
-            gid = cmd.split(" ",1)[1].strip(); ok,msg = reject_driver_group(gid, uid); return reply(tok, ("✅ " if ok else "⛔ ")+msg)
+            gid=resolve_driver_group_ref(cmd.split(" ",1)[1],"pending")
+            if not gid:return reply(tok,"找不到該編號；請先輸入「待審核司機群組」重新確認。")
+            ok,msg=reject_driver_group(gid,uid); return reply(tok,msg if ok else "⛔ "+msg)
         if cmd.startswith("解除司機群組 "):
-            gid = cmd.split(" ",1)[1].strip()
-            if gid not in get_driver_groups(): return reply(tok, "該群組目前未綁定。")
-            unbind_driver_group(gid, "manual_by_root_admin_line", uid); return reply(tok, "✅ 已解除群組綁定並保留歷史紀錄。")
+            gid=resolve_driver_group_ref(cmd.split(" ",1)[1])
+            if not gid or gid not in get_driver_groups():return reply(tok,"該編號不是目前使用中的群組；請重新查看「司機群組列表」。")
+            ok,msg=unbind_driver_group(gid,"manual_by_root_admin_line",uid); return reply(tok,msg if ok else "⛔ "+msg)
         if cmd == "清理全部":
             return reply(tok, clear_all_pending_shouts())
         if cmd in ("訂單列表", "列表", "可接訂單"):
@@ -1583,12 +1653,12 @@ def passive_remind(event):
 # ---------------- 私訊：管理員綁定 / 狀態 ----------------
 def on_private(event, text, src):
     # 派單指令及管理指令只能在已綁定派單群組執行；私人聊天室不授權任何操作。
-    return reply(event.reply_token, "CAR SPEED 權限說明：管理及派單指令僅能在已綁定的派單群組內，由最高管理員或已授權派單員執行。")
+    return reply(event.reply_token, "黑貓B.B.C 權限說明：管理及派單指令僅能在已綁定的派單群組內，由最高管理員或已授權派單員執行。")
 
 
 def status_text():
     return (
-        "📊 CAR SPEED 系統狀態\n"
+        "📊 黑貓B.B.C 系統狀態\n"
         f"最高管理員：{'已綁定' if S.get('root_admin_id') else '未初始化'}\n"
         f"派單員人數：{len(S.get('dispatcher_users', []))}\n"
         f"司機群組：{len(get_driver_groups())} 個已綁定\n"
@@ -1605,27 +1675,26 @@ def status_text():
 
 # ---------------- 角色分級指令說明 ----------------
 BASIC_HELP = (
-    "CAR SPEED 系統說明\n"
-    "本群不是已授權的派單操作入口。\n"
+    "黑貓B.B.C 系統說明\\n本群不是已授權的派單操作入口。\\n"
     "派單操作僅限最高管理員或經授權派單員，在已綁定派單群組內執行。"
 )
 
 DISPATCHER_HELP = (
-    "🧑‍💼 CAR SPEED｜派單員指令\n"
-    "派單 訂單內容 → 新增可接訂單\n"
-    "取消 → 結束全部進行中派單並公告\n"
-    "喊單列表 → 查看司機待處理喊單\n"
-    "回 @司機名稱 內容 → 回覆該司機最新喊單\n"
-    "/help → 查看派單員指令"
+    "🧑‍💼 黑貓B.B.C｜一般派單員指令\\n"
+    "派單 訂單內容 → 新增可接訂單\\n取消 → 結束全部進行中派單並公告\\n"
+    "喊單列表 → 查看司機待處理喊單\\n司機群組列表 → 查看所有司機群組狀態\\n"
+    "待審核司機群組 → 查看待審核申請\\n即時看板 → 開啟管理看板\\n"
+    "回 @司機名稱 內容 → 回覆該司機最新喊單\\nHelp → 查看派單員指令"
 )
 
 ROOT_HELP = (
-    "👑 CAR SPEED｜最高管理員完整指令\n\n"
-    "【派單操作】\n派單 訂單內容\n取消\n喊單列表\n回 @司機名稱 內容\n訂單列表\n清理全部\n狀態\n\n"
-    "【人員管理】\n指派派單員 @人員\n撤銷派單 @人員\n派單員列表\n派單權限紀錄\n\n"
-    "【群組管理】\n綁定派單群組\n綁定司機群組\n\n"
-    "【最高管理員】\n轉讓最高管理員 @人員\n接受最高管理員（新任人員）\n確認轉讓最高管理員（現任最高管理員）\n\n"
-    "/help → 顯示最高管理員完整指令"
+    "👑 黑貓B.B.C｜最高管理員指令\\n\\n"
+    "【派單操作】\\n派單 訂單內容\\n取消\\n喊單列表\\n回 @司機名稱 內容\\n訂單列表\\n清理全部\\n狀態\\n即時看板\\n\\n"
+    "【人員管理】\\n指派派單員 @人員\\n撤銷派單 @人員\\n派單員列表\\n派單權限紀錄\\n\\n"
+    "【司機群組管理】\\n司機群組列表\\n待審核司機群組\\n核准司機群組 編號\\n拒絕司機群組 編號\\n解除司機群組 編號\\n"
+    "【派單群組】\\n綁定派單群組\\n\\n"
+    "【最高管理員】\\n轉讓最高管理員 @人員\\n接受最高管理員（新任人員）\\n確認轉讓最高管理員（現任最高管理員）\\n"
+    "Help → 顯示最高管理員完整指令"
 )
 
 PRIVATE_HELP = BASIC_HELP
