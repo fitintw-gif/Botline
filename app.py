@@ -23,7 +23,7 @@ from linebot.v3.webhooks import (MessageEvent, TextMessageContent, GroupSource, 
 
 # ============================================================
 # 黑貓B.B.C v3.9.0｜LINE Login 管理後台雙向同步版
-# 黑貓B.B.C 雙群組版
+# 黑貓B.B.C 雙群組版｜v3.9.2 固定資費整合測試版
 # 司機群組：司機喊單、接收派單／指定司機／取消通知
 # 派單員群組：管理員查看喊單、發布訂單、指定司機及管理訂單
 # 派單員指定司機／回覆／取消：先寫入待通知佇列，不使用 Push API。
@@ -58,7 +58,7 @@ def default_state():
         "pending_root_transfer": None, "permission_revocations": [],
         "driver_group": None, "driver_groups": [], "dispatcher_group": None,
         "driver_group_records": [], "pending_driver_group_requests": [], "admin_audit_log": [], "member_directory": {}, "dispatcher_profiles": {},
-        "next_id": 1, "orders": {}, "drivers": {},
+        "next_id": 1, "orders": {}, "drivers": {}, "fixed_fare_text": "",
         "dispatcher_replies": [], "pending_notifications": [], "last_passive_ts": 0.0, "seen_message_ids": []
     }
 
@@ -98,6 +98,9 @@ def load():
         data["member_directory"] = {}
     if not isinstance(data.get("dispatcher_profiles"), dict):
         data["dispatcher_profiles"] = {}
+    # 全域固定資費獨立保存；不混入訂單地點資料，升級舊 state 時預設為空。
+    if not isinstance(data.get("fixed_fare_text"), str):
+        data["fixed_fare_text"] = ""
     # 舊版已綁定群組自動遷移為 approved，絕不要求既有群組重新申請。
     known = {x.get("group_id") for x in data["driver_group_records"] if isinstance(x, dict)}
     for gid in data.get("driver_groups", []):
@@ -569,8 +572,36 @@ def dispatch_order_locations(order):
 
 
 def format_dispatch_order(order):
+    """顯示地點後附加目前全域資費原文；資費不進入地點陣列、不參與編號。"""
     locations = dispatch_order_locations(order)
-    return render_dispatch_locations(locations) if locations else "（尚未設定地點）"
+    body = render_dispatch_locations(locations) if locations else "（尚未設定地點）"
+    fare_text = str(S.get("fixed_fare_text", "") or "").strip()
+    return body + ("\n\n" + fare_text if fare_text else "")
+
+
+def set_fixed_fare_text(raw_text):
+    """儲存全域固定資費原文；保留內部換行、符號與排版。"""
+    value = str(raw_text or "").strip()
+    if not value:
+        raise ValueError("資費內容不可空白。")
+    if len(value) > 2500:
+        raise ValueError("資費內容過長，請控制在 2,500 字元內，以免派單訊息超過 LINE 長度限制。")
+    S["fixed_fare_text"] = value
+    save()
+    # 現有派單也應改用最新資費；只排更新標記，不保存舊文字快照。
+    if active_dispatch_orders():
+        queue_dispatch_refresh()
+    return value
+
+
+def clear_fixed_fare_text():
+    """清除全域固定資費；現有派單下次 Reply 時也會呈現清除後內容。"""
+    had_value = bool(str(S.get("fixed_fare_text", "") or "").strip())
+    S["fixed_fare_text"] = ""
+    save()
+    if had_value and active_dispatch_orders():
+        queue_dispatch_refresh()
+    return had_value
 
 
 def active_dispatch_orders():
@@ -592,9 +623,11 @@ def latest_active_dispatch():
     return dispatches[-1] if dispatches else (None, None)
 
 
-def persist_dispatch_locations(order_id, order, locations, actor_user_id=None):
+def persist_dispatch_locations(order_id, order, locations, actor_user_id=None, raw_content=None):
     order["locations"] = list(locations)
     order["content"] = render_dispatch_locations(locations)
+    if raw_content is not None:
+        order["raw_content"] = str(raw_content)
     order["updated_at"] = now_tw()
     order["updated_ts"] = time.time()
     order["location_revision"] = int(order.get("location_revision", 0) or 0) + 1
@@ -1637,6 +1670,8 @@ def on_group(event, text, src):
 def on_driver_group(event, text, src):
     tok, uid = event.reply_token, src.user_id
 
+    if re.match(r"^(設定資費|更新資費|查看資費|清除資費)(?:\s|$)", str(text or "").strip()):
+        return driver_group_reply(event, "⛔ 固定資費僅限已授權派單員在派單群組管理，司機群組不可設定或修改。", allow_passive=False)
     if text in ("使用說明", "幫助", "help", "/help"):
         return None  # 依規格：司機不提供 Help 功能
     if text in ("訂單列表", "可接訂單", "列表"):
@@ -1683,6 +1718,34 @@ def on_dispatcher_group(event, text, src):
 
     if cmd in ("使用說明", "幫助") or cmd.casefold() in ("help", "/help"):
         return reply(tok, help_for_user(uid))
+
+    # 全域固定資費管理：僅授權派單員可進入此分支；原文獨立保存，不送入地點解析器。
+    fare_match = re.match(r"^(設定資費|更新資費)(?:[ \t]*\n+[ \t]*|[ \t]+)([\s\S]+)$", cmd)
+    if fare_match:
+        fare_action, fare_payload = fare_match.group(1), fare_match.group(2).strip()
+        current_fare = str(S.get("fixed_fare_text", "") or "").strip()
+        if fare_action == "設定資費" and current_fare:
+            return reply(tok, "目前已設定固定資費；如要替換內容，請使用「更新資費」加上完整新內容。")
+        if fare_action == "更新資費" and not current_fare:
+            return reply(tok, "目前尚未設定固定資費，請先使用「設定資費」加上完整內容。")
+        try:
+            set_fixed_fare_text(fare_payload)
+        except ValueError as exc:
+            return reply(tok, "⛔ " + str(exc))
+        action_label = "設定" if fare_action == "設定資費" else "更新"
+        active_count = len(active_dispatch_orders())
+        return reply(tok, f"✅ 已{action_label}全域固定資費。\n資費原文已保存，之後新派單會自動附加；目前 {active_count} 筆進行中派單也會改用最新資費。")
+    if cmd in ("設定資費", "更新資費"):
+        return reply(tok, f"格式：{cmd}\n請在下一行貼上完整固定資費內容；系統會保留原文換行與符號。")
+    if cmd == "查看資費":
+        current_fare = str(S.get("fixed_fare_text", "") or "").strip()
+        return reply(tok, "📋 目前全域固定資費\n\n" + current_fare if current_fare else "目前尚未設定固定資費。")
+    if cmd == "清除資費":
+        had_value = clear_fixed_fare_text()
+        return reply(tok, "✅ 已清除全域固定資費；新派單不再自動附加，進行中的派單也會在司機群下一次 Reply 時移除資費內容。" if had_value else "目前沒有固定資費設定，無須清除。")
+    if re.match(r"^(設定資費|更新資費)", cmd):
+        return reply(tok, "格式：設定資費\n完整資費內容\n（若已設定，請改用「更新資費」）")
+
     if cmd=="即時看板":
         return reply(tok, "📊 黑貓B.B.C 即時管理看板\n\n點擊以下網址開啟：\nhttps://botline-6jwy.onrender.com/dashboard")
 
@@ -1798,6 +1861,22 @@ def on_dispatcher_group(event, text, src):
         # 取消訂單只更新系統狀態，不向任何司機群組發布公告或排入通知佇列。
         result = cancel_all_orders()
         return reply(tok, result)
+
+    # 更新派單：完整替換最新一筆進行中的派單地點，不建立新訂單或更換內部 ID。
+    update_match = re.match(r"^更新派單(?:[ \t]*\n+|[ \t]+)([\s\S]+)$", cmd)
+    if update_match:
+        raw_content = update_match.group(1).strip()
+        locations = parse_dispatch_locations(raw_content)
+        if not locations:
+            return reply(tok, "請提供完整的新地點清單。格式：更新派單\n地點A\n地點B")
+        oid, order = latest_active_dispatch()
+        if not order:
+            return reply(tok, "目前沒有進行中的派單，更新未執行；如要建立新派單，請使用「派單」。")
+        persist_dispatch_locations(oid, order, locations, uid, raw_content=raw_content)
+        return reply(tok, "✅ 已完整更新原派單（未建立新派單、內部訂單 ID 不變）。\n" + format_dispatch_order(order)
+                    + "\n\n司機群組下一次有新訊息時，會以 Reply 顯示最新完整地點與固定資費內容。")
+    if cmd == "更新派單":
+        return reply(tok, "格式：更新派單\n地點A\n地點B\n（完整取代最新一筆進行中的派單；不建立新派單）")
 
     # 追加地點／追加訂單：更新最新一筆進行中的派單，不建立新內部訂單。
     append_match = re.match(r"^(追加地點|追加訂單|追加)\s+(.+)$", cmd, re.S)
@@ -1973,10 +2052,17 @@ DISPATCHER_HELP = (
     "🧑‍💼 黑貓B.B.C｜一般派單員指令\n\n"
     "【派單操作】\n"
     "派單 地點A\n地點B → 新增派單（自動編號地點）\n"
+    "更新派單\n地點A\n地點B → 完整取代最新進行中派單，不建立新派單\n"
     "追加地點 地點C → 追加到最新進行中派單（不建立新派單）\n"
     "修改地點 2 新地點 → 修改第 2 個地點\n"
     "刪除地點 2 → 刪除第 2 個地點並重新編號\n"
-    "取消 → 結束全部進行中派單（不公告）\n"
+    "取消 → 結束全部進行中派單（不公告）\n\n"
+    "【固定資費管理】\n"
+    "設定資費\n完整內容 → 首次設定全域固定資費，自動附加在派單地點後\n"
+    "更新資費\n完整內容 → 替換目前固定資費，新舊派單均改用最新內容\n"
+    "查看資費 → 查看目前全域固定資費原文\n"
+    "清除資費 → 清除固定資費，停止自動附加\n\n"
+    "【司機喊單】\n"
     "喊單列表 → 查看司機待處理喊單\n"
     "回 @司機名稱 內容 → 回覆該司機最新喊單\n\n"
     "【群組與看板查詢】\n"
@@ -1989,7 +2075,9 @@ DISPATCHER_HELP = (
 ROOT_HELP = (
     "👑 黑貓B.B.C｜最高管理員指令\n\n"
     "【派單操作】\n"
-    "派單 地點A\n地點B\n追加地點 地點C\n修改地點 2 新地點\n刪除地點 2\n取消（不公告）\n喊單列表\n回 @司機名稱 內容\n訂單列表\n清理全部\n狀態\n即時看板\n\n"
+    "派單 地點A\n地點B\n更新派單\n地點A\n地點B（完整取代最新派單）\n追加地點 地點C\n修改地點 2 新地點\n刪除地點 2\n取消（不公告）\n喊單列表\n回 @司機名稱 內容\n訂單列表\n清理全部\n狀態\n即時看板\n\n"
+    "【固定資費管理】\n"
+    "設定資費\n完整內容（首次設定）\n更新資費\n完整內容（替換內容）\n查看資費\n清除資費\n\n"
     "【人員管理】\n"
     "指派派單員 @人員\n撤銷派單 @人員\n派單員列表\n派單權限紀錄\n\n"
     "【司機群組管理】\n"
