@@ -1101,7 +1101,7 @@ def callback():
 
 @app.get("/")
 def health():
-    return "黑貓B.B.C v3.9.4 mini dashboard test build is running"
+    return "黑貓B.B.C v3.9.5 draggable mini dashboard is running"
 
 
 # ---------------- LIFF / 網頁即時派單看板 ----------------
@@ -1127,23 +1127,23 @@ button.active{background:#173e4a;color:white}.pill{font-size:11px;padding:6px 9p
 .driver{font-weight:bold;margin:8px 0}.empty{background:white;border-radius:14px;padding:18px;text-align:center;color:#78878c;font-size:13px}
 .foot{text-align:center;color:#89969a;font-size:11px;padding:22px 0}
 
-/* v3.9.4：頁面內可拖曳迷你即時看板（不覆蓋 LINE 聊天視窗） */
+/* v3.9.5：完整看板隱藏；迷你面板與收起圖示皆可拖曳 */
 .mini-launch{margin-top:12px;background:#65dc82;color:#123b28;border:0;font-weight:800}
-.mini-board{position:fixed;z-index:9999;right:14px;bottom:18px;width:min(310px,calc(100vw - 28px));background:#17191d;color:#fff;border:1px solid #3b424a;border-radius:18px;padding:12px;box-shadow:0 10px 35px #0005;display:none;touch-action:pan-y}
+.mini-board{position:fixed;z-index:9999;right:14px;bottom:18px;width:min(360px,calc(100vw - 28px));background:#17191d;color:#fff;border:1px solid #3b424a;border-radius:18px;padding:12px;box-shadow:0 10px 35px #0005;display:none;touch-action:pan-y}
 .mini-board.visible{display:block}
 .mini-head{display:flex;align-items:center;justify-content:space-between;gap:8px;cursor:grab;touch-action:none;user-select:none}
 .mini-head:active{cursor:grabbing}
 .mini-brand{font-weight:800;font-size:13px;letter-spacing:.3px}
 .mini-live{font-size:10px;color:#72e392}
-.mini-metrics{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
-.mini-metric{background:#292d33;border-radius:12px;padding:10px}
-.mini-value{font-size:25px;font-weight:850;color:#72e392;line-height:1.2}
-.mini-label{font-size:11px;color:#c4cbd2;margin-top:4px}
+.mini-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-top:10px}
+.mini-metric{background:#292d33;border-radius:12px;padding:9px 7px;min-width:0}
+.mini-value{font-size:25px;font-weight:850;color:#72e392;line-height:1.2}.mini-metric:first-child .mini-value,.mini-metric:last-child .mini-value{color:#fff}
+.mini-label{font-size:11px;color:#c4cbd2;margin-top:4px;line-height:1.35}
 .mini-actions{display:flex;justify-content:space-between;align-items:center;margin-top:9px}
 .mini-actions button{background:#30363d;border-color:#4a535d;color:#fff;padding:6px 10px}
 .mini-hint{font-size:10px;color:#aab3bc}
 .mini-collapsed{position:fixed;z-index:10000;right:14px;bottom:18px;width:58px;height:58px;border-radius:18px;background:#172f39;color:white;border:2px solid #65dc82;box-shadow:0 8px 24px #0004;display:none;font-size:12px;font-weight:800}
-.mini-collapsed.visible{display:block}
+.mini-collapsed.visible{display:block}.mini-collapsed{touch-action:none;user-select:none;cursor:grab}body.mini-mode .app{display:none}
 
 @media(max-width:400px){.app{padding:10px}.stat{padding:10px}.num{font-size:23px}}
 </style></head><body><main class="app">
@@ -1169,12 +1169,13 @@ button.active{background:#173e4a;color:white}.pill{font-size:11px;padding:6px 9p
 </main>
 <aside id="miniBoard" class="mini-board" aria-label="CAR SPEED 迷你即時看板">
  <div class="mini-head" id="miniDragHandle">
-  <div><div class="mini-brand">🚘 CAR SPEED <span class="mini-live">● LIVE</span></div><div class="mini-hint">按住此處可拖曳</div></div>
+  <div><div class="mini-brand">🚘 CAR SPEED <span class="mini-live">● LIVE</span></div><div class="mini-hint">長按面板可移動</div></div>
   <button id="miniExpand" type="button">展開</button>
  </div>
  <div class="mini-metrics">
-  <div class="mini-metric"><div class="mini-value" id="miniDispatchCount">—</div><div class="mini-label">有效訂單</div></div>
+  <div class="mini-metric"><div class="mini-value" id="miniDispatchCount">—</div><div class="mini-label">進行中派單</div></div>
   <div class="mini-metric"><div class="mini-value" id="miniReplyCount">—</div><div class="mini-label">司機已回覆</div></div>
+  <div class="mini-metric"><div class="mini-value" id="miniPendingCount">—</div><div class="mini-label">待處理喊單</div></div>
  </div>
  <div class="mini-actions"><span class="mini-hint" id="miniUpdated">等待同步…</span><button id="miniHide" type="button">收起</button></div>
 </aside>
@@ -1196,6 +1197,7 @@ function render(data){
  document.getElementById("pendingCount").textContent=data.shouts.filter(x=>x.status==="pending").length;
  document.getElementById("miniDispatchCount").textContent=String(data.dispatches.length).padStart(2,"0");
  document.getElementById("miniReplyCount").textContent=String(data.shouts.filter(x=>x.status==="replied"||x.status==="completed").length).padStart(2,"0");
+ document.getElementById("miniPendingCount").textContent=String(data.shouts.filter(x=>x.status==="pending").length).padStart(2,"0");
  document.getElementById("miniUpdated").textContent="更新 "+new Date().toLocaleTimeString("zh-TW",{hour12:false});
  const list=data.shouts.filter(x=>filter==="all"||(filter==="replied"&&x.status==="replied")||(filter==="pending"&&x.status==="pending")||(filter==="completed"&&x.status==="completed"));
  document.getElementById("replies").innerHTML=list.length?list.map(cardReply).join(""):'<div class="empty">目前沒有符合條件的紀錄</div>';
@@ -1234,48 +1236,26 @@ async function reloginLine(){
  catch(e){showDashboardError("重新登入失敗："+e.message,true)}
 }
 
-// 迷你看板只在目前網頁/LIFF 視窗內浮動；不會浮在 LINE 聊天畫面上方。
+// 迷你看板只在目前網頁/LIFF 視窗內浮動；縮小後隱藏完整頁面內容。
 const miniBoard=document.getElementById("miniBoard");
 const miniCollapsed=document.getElementById("miniCollapsed");
-document.getElementById("miniLaunch").addEventListener("click",()=>{
- miniBoard.classList.add("visible");miniCollapsed.classList.remove("visible");
-});
-document.getElementById("miniExpand").addEventListener("click",()=>{
- miniBoard.classList.remove("visible");window.scrollTo({top:0,behavior:"smooth"});
-});
-document.getElementById("miniHide").addEventListener("click",()=>{
- miniBoard.classList.remove("visible");miniCollapsed.classList.add("visible");
-});
-miniCollapsed.addEventListener("click",()=>{
- miniCollapsed.classList.remove("visible");miniBoard.classList.add("visible");
-});
-(()=>{
- const handle=document.getElementById("miniDragHandle");
- let dragging=false,startX=0,startY=0,left=0,top=0;
- handle.addEventListener("pointerdown",e=>{
-  if(e.target.closest("button"))return;
-  const r=miniBoard.getBoundingClientRect();
-  dragging=true;startX=e.clientX;startY=e.clientY;left=r.left;top=r.top;
-  handle.setPointerCapture(e.pointerId);e.preventDefault();
- });
- handle.addEventListener("pointermove",e=>{
-  if(!dragging)return;
-  const maxLeft=Math.max(0,window.innerWidth-miniBoard.offsetWidth);
-  const maxTop=Math.max(0,window.innerHeight-miniBoard.offsetHeight);
-  const x=Math.min(maxLeft,Math.max(0,left+e.clientX-startX));
-  const y=Math.min(maxTop,Math.max(0,top+e.clientY-startY));
-  miniBoard.style.left=x+"px";miniBoard.style.top=y+"px";
-  miniBoard.style.right="auto";miniBoard.style.bottom="auto";
- });
- const stop=()=>{dragging=false};
- handle.addEventListener("pointerup",stop);handle.addEventListener("pointercancel",stop);
- window.addEventListener("resize",()=>{
-  if(!miniBoard.classList.contains("visible"))return;
-  const r=miniBoard.getBoundingClientRect();
-  miniBoard.style.left=Math.max(0,Math.min(r.left,window.innerWidth-miniBoard.offsetWidth))+"px";
-  miniBoard.style.top=Math.max(0,Math.min(r.top,window.innerHeight-miniBoard.offsetHeight))+"px";
- });
-})();
+const enterMiniMode=()=>{document.body.classList.add("mini-mode");miniBoard.classList.add("visible");miniCollapsed.classList.remove("visible")};
+const leaveMiniMode=()=>{document.body.classList.remove("mini-mode");miniBoard.classList.remove("visible");miniCollapsed.classList.remove("visible");window.scrollTo({top:0,behavior:"smooth"})};
+document.getElementById("miniLaunch").addEventListener("click",enterMiniMode);
+document.getElementById("miniExpand").addEventListener("click",leaveMiniMode);
+document.getElementById("miniHide").addEventListener("click",()=>{miniBoard.classList.remove("visible");miniCollapsed.classList.add("visible")});
+miniCollapsed.addEventListener("click",()=>{if(miniCollapsed.dataset.moved==="1"){miniCollapsed.dataset.moved="0";return}miniCollapsed.classList.remove("visible");miniBoard.classList.add("visible")});
+// 迷你面板標題列可拖曳；收起後的 LIVE 圖示也可拖曳，點擊則重新展開。
+function enableDrag(element, getRectElement, ignoreButtons){
+ let active=false,moved=false,startX=0,startY=0,originX=0,originY=0;
+ element.addEventListener("pointerdown",e=>{if(ignoreButtons&&e.target.closest("button"))return;const r=getRectElement().getBoundingClientRect();active=true;moved=false;startX=e.clientX;startY=e.clientY;originX=r.left;originY=r.top;element.setPointerCapture(e.pointerId);e.preventDefault()});
+ element.addEventListener("pointermove",e=>{if(!active)return;const dx=e.clientX-startX,dy=e.clientY-startY;if(Math.abs(dx)+Math.abs(dy)>5)moved=true;const r=getRectElement();const x=Math.max(0,Math.min(window.innerWidth-r.offsetWidth,originX+dx));const y=Math.max(0,Math.min(window.innerHeight-r.offsetHeight,originY+dy));r.style.left=x+"px";r.style.top=y+"px";r.style.right="auto";r.style.bottom="auto"});
+ const stop=()=>{if(active&&element===miniCollapsed&&moved)miniCollapsed.dataset.moved="1";active=false};
+ element.addEventListener("pointerup",stop);element.addEventListener("pointercancel",stop);
+}
+enableDrag(document.getElementById("miniDragHandle"),()=>miniBoard,true);
+enableDrag(miniCollapsed,()=>miniCollapsed,false);
+window.addEventListener("resize",()=>{[miniBoard,miniCollapsed].forEach(el=>{if(!el.classList.contains("visible"))return;const r=el.getBoundingClientRect();el.style.left=Math.max(0,Math.min(r.left,window.innerWidth-el.offsetWidth))+"px";el.style.top=Math.max(0,Math.min(r.top,window.innerHeight-el.offsetHeight))+"px"})});
 
 async function startLiff(){
  try{
