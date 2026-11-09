@@ -23,7 +23,7 @@ from linebot.v3.webhooks import (MessageEvent, TextMessageContent, GroupSource, 
 
 # ============================================================
 # 黑貓B.B.C v3.9.0｜LINE Login 管理後台雙向同步版
-# 黑貓B.B.C 雙群組版｜v3.9.2 固定資費整合測試版
+# 黑貓B.B.C 雙群組版｜v3.9.3 固定資費＋多筆訂單管理測試版
 # 司機群組：司機喊單、接收派單／指定司機／取消通知
 # 派單員群組：管理員查看喊單、發布訂單、指定司機及管理訂單
 # 派單員指定司機／回覆／取消：先寫入待通知佇列，不使用 Push API。
@@ -59,6 +59,7 @@ def default_state():
         "driver_group": None, "driver_groups": [], "dispatcher_group": None,
         "driver_group_records": [], "pending_driver_group_requests": [], "admin_audit_log": [], "member_directory": {}, "dispatcher_profiles": {},
         "next_id": 1, "orders": {}, "drivers": {}, "fixed_fare_text": "",
+        "pending_order_deletions": {},
         "dispatcher_replies": [], "pending_notifications": [], "last_passive_ts": 0.0, "seen_message_ids": []
     }
 
@@ -98,6 +99,8 @@ def load():
         data["member_directory"] = {}
     if not isinstance(data.get("dispatcher_profiles"), dict):
         data["dispatcher_profiles"] = {}
+    if not isinstance(data.get("pending_order_deletions"), dict):
+        data["pending_order_deletions"] = {}
     # 全域固定資費獨立保存；不混入訂單地點資料，升級舊 state 時預設為空。
     if not isinstance(data.get("fixed_fare_text"), str):
         data["fixed_fare_text"] = ""
@@ -352,7 +355,8 @@ def driver_group_reply(event, text=None, allow_passive=True):
                 continue
             board = format_active_dispatch_board(orders)
             if not board:
-                stale_notification_ids.append(item_id)
+                # 單筆刪除最後一筆訂單時，也讓該群下次事件收到最新的空列表狀態。
+                notification_pairs.append((item_id, TextMessage(text="📋 目前沒有進行中的派單。")))
                 continue
             body = f"📣 派單內容已更新\n{board}\n\n以上為最新完整派單內容。"
             if len(body) > 4800:
@@ -610,10 +614,11 @@ def active_dispatch_orders():
 
 
 def format_active_dispatch_board(orders=None):
+    """司機端看板：每筆獨立派單各自編號，不顯示內部訂單 ID。"""
     dispatches = orders if orders is not None else active_dispatch_orders()
     blocks = []
-    for _, order in dispatches:
-        blocks.append("📍 派單內容\n" + format_dispatch_order(order))
+    for index, (_, order) in enumerate(dispatches, 1):
+        blocks.append(f"【第 {index} 筆訂單】\n" + format_dispatch_order(order))
     return "📦 目前可接派單\n────────────\n" + "\n\n────────────\n\n".join(blocks) if blocks else ""
 
 
@@ -882,9 +887,93 @@ def dispatcher_shout_list():
     return "\n".join(rows)
 
 
-def active_order_list():
-    board = format_active_dispatch_board()
-    return board if board else "目前沒有進行中的派單。"
+def active_order_list(include_actions=False):
+    """列出多筆獨立派單；派單員可選擇顯示訂單管理操作，司機端不顯示。"""
+    dispatches = active_dispatch_orders()
+    if not dispatches:
+        lines = ["📋 目前沒有進行中的訂單。"]
+    else:
+        lines = ["📋 目前所有有效訂單（每一筆都是獨立訂單）", "━━━━━━━━━━━━"]
+        for index, (_, order) in enumerate(dispatches, 1):
+            lines.extend([
+                f"【第 {index} 筆訂單】",
+                format_dispatch_order(order),
+                "狀態：派單中",
+                "━━━━━━━━━━━━",
+            ])
+    if include_actions:
+        lines.extend([
+            "【訂單列表操作】",
+            "刪除訂單 編號 → 選取列表中的整筆獨立訂單，系統會先要求二次確認。",
+            "確認刪除訂單 → 確認刪除剛才選取的訂單。",
+            "取消刪除訂單 → 放棄本次刪除。",
+        ])
+    return "\n".join(lines)
+
+
+def request_order_delete(user_id, group_id, display_index):
+    """依目前訂單列表編號選取一筆獨立訂單，建立限時且綁定操作者的二次確認。"""
+    dispatches = active_dispatch_orders()
+    if display_index < 1 or display_index > len(dispatches):
+        return f"找不到第 {display_index} 筆訂單；目前共有 {len(dispatches)} 筆進行中訂單。請先輸入「訂單列表」重新查看。"
+    order_id, order = dispatches[display_index - 1]
+    key = f"{group_id or ''}:{user_id or ''}"
+    S.setdefault("pending_order_deletions", {})[key] = {
+        "order_id": str(order_id),
+        "requested_by": str(user_id),
+        "group_id": str(group_id or ""),
+        "display_index": int(display_index),
+        "created_at": now_tw(),
+        "expires_at": time.time() + 180,
+    }
+    save()
+    return (
+        "⚠️ 刪除訂單二次確認\n\n"
+        f"即將刪除：【第 {display_index} 筆訂單】\n"
+        f"{format_dispatch_order(order)}\n\n"
+        "這是整筆獨立訂單，不是刪除其中一個地點。\n"
+        "確認請輸入：確認刪除訂單\n"
+        "放棄請輸入：取消刪除訂單\n"
+        "確認期限：3 分鐘；逾時需重新從訂單列表選取。"
+    )
+
+
+def confirm_order_delete(user_id, group_id):
+    """只允許原選取者在原派單群組確認；後端以內部唯一 ID 鎖定目標。"""
+    key = f"{group_id or ''}:{user_id or ''}"
+    pending = S.setdefault("pending_order_deletions", {}).get(key)
+    if not pending:
+        return "目前沒有等待你確認的刪除訂單操作；請先輸入「訂單列表」及「刪除訂單 編號」。"
+    if time.time() > float(pending.get("expires_at", 0) or 0):
+        S["pending_order_deletions"].pop(key, None)
+        save()
+        return "⏰ 刪除確認已逾時，訂單未刪除。請重新輸入「訂單列表」選取。"
+    order_id = str(pending.get("order_id", ""))
+    order = S.get("orders", {}).get(order_id)
+    if not order or order.get("kind") != "dispatch" or order.get("status", "active") != "active":
+        S["pending_order_deletions"].pop(key, None)
+        save()
+        return "原選取訂單已不存在或狀態已變更，未執行刪除。請重新查看「訂單列表」。"
+    order["status"] = "deleted"
+    order["deleted_at"] = now_tw()
+    order["deleted_by"] = str(user_id)
+    order["delete_reason"] = "dispatcher_confirmed_single_order_delete"
+    display_index = pending.get("display_index", "?")
+    S["pending_order_deletions"].pop(key, None)
+    save()
+    # 每個司機群各自排一個更新標記；下次該群有事件時讀取最新完整訂單列表。
+    queue_dispatch_refresh()
+    return (f"✅ 已刪除你先前選取的第 {display_index} 筆整筆訂單。\n"
+            "其他有效訂單及其內部唯一 ID 均未變更；列表顯示編號會自動重新排列。")
+
+
+def cancel_order_delete(user_id, group_id):
+    key = f"{group_id or ''}:{user_id or ''}"
+    pending = S.setdefault("pending_order_deletions", {}).pop(key, None)
+    if not pending:
+        return "目前沒有等待確認的刪除訂單操作。"
+    save()
+    return "已取消本次刪除訂單操作，原訂單保留不變。"
 
 
 def cancel_all_orders():
@@ -1672,6 +1761,8 @@ def on_driver_group(event, text, src):
 
     if re.match(r"^(設定資費|更新資費|查看資費|清除資費)(?:\s|$)", str(text or "").strip()):
         return driver_group_reply(event, "⛔ 固定資費僅限已授權派單員在派單群組管理，司機群組不可設定或修改。", allow_passive=False)
+    if re.match(r"^(刪除訂單|確認刪除訂單|取消刪除訂單)(?:\s|$)", str(text or "").strip()):
+        return driver_group_reply(event, "⛔ 整筆訂單刪除僅限已授權派單員在派單群組操作。", allow_passive=False)
     if text in ("使用說明", "幫助", "help", "/help"):
         return None  # 依規格：司機不提供 Help 功能
     if text in ("訂單列表", "可接訂單", "列表"):
@@ -1693,7 +1784,7 @@ def on_driver_group(event, text, src):
 
 
 def on_dispatcher_group(event, text, src):
-    tok, uid = event.reply_token, src.user_id
+    tok, uid, gid = event.reply_token, src.user_id, src.group_id
     mentioned, rest = strip_self_mention(event.message)
     cmd = (rest if mentioned else text).strip()
     if cmd == "接受最高管理員":
@@ -1746,6 +1837,19 @@ def on_dispatcher_group(event, text, src):
     if re.match(r"^(設定資費|更新資費)", cmd):
         return reply(tok, "格式：設定資費\n完整資費內容\n（若已設定，請改用「更新資費」）")
 
+    # 訂單列表與整筆訂單刪除屬一般派單管理，所有授權派單員均可操作。
+    if cmd == "訂單列表":
+        return reply(tok, active_order_list(include_actions=True))
+    delete_order_match = re.match(r"^刪除訂單\s+(\d+)\s*$", cmd)
+    if delete_order_match:
+        return reply(tok, request_order_delete(uid, gid, int(delete_order_match.group(1))))
+    if cmd.startswith("刪除訂單"):
+        return reply(tok, "格式：刪除訂單 2（編號請依「訂單列表」顯示；選取後仍須二次確認）")
+    if cmd == "確認刪除訂單":
+        return reply(tok, confirm_order_delete(uid, gid))
+    if cmd == "取消刪除訂單":
+        return reply(tok, cancel_order_delete(uid, gid))
+
     if cmd=="即時看板":
         return reply(tok, "📊 黑貓B.B.C 即時管理看板\n\n點擊以下網址開啟：\nhttps://botline-6jwy.onrender.com/dashboard")
 
@@ -1774,8 +1878,6 @@ def on_dispatcher_group(event, text, src):
             ok,msg=unbind_driver_group(gid,"manual_by_root_admin_line",uid); return reply(tok,msg if ok else "⛔ "+msg)
         if cmd == "清理全部":
             return reply(tok, clear_all_pending_shouts())
-        if cmd in ("訂單列表", "列表", "可接訂單"):
-            return reply(tok, active_order_list())
         if cmd == "狀態":
             return reply(tok, status_text())
         if cmd.startswith("指派派單員"):
@@ -2055,8 +2157,13 @@ DISPATCHER_HELP = (
     "更新派單\n地點A\n地點B → 完整取代最新進行中派單，不建立新派單\n"
     "追加地點 地點C → 追加到最新進行中派單（不建立新派單）\n"
     "修改地點 2 新地點 → 修改第 2 個地點\n"
-    "刪除地點 2 → 刪除第 2 個地點並重新編號\n"
-    "取消 → 結束全部進行中派單（不公告）\n\n"
+    "刪除地點 2 → 刪除最新進行中派單內的第 2 個地點並重新編號\n"
+    "取消（取消自動刷單，不公告）\n\n"
+    "【訂單列表與整筆訂單管理】\n"
+    "訂單列表（查看目前所有訂單）→ 顯示多筆獨立訂單及操作方式\n"
+    "刪除訂單 編號 → 選取指定整筆訂單，接著輸入「確認刪除訂單」二次確認\n"
+    "確認刪除訂單 → 確認刪除剛選取的整筆訂單\n"
+    "取消刪除訂單 → 放棄本次刪除\n"
     "【固定資費管理】\n"
     "設定資費\n完整內容 → 首次設定全域固定資費，自動附加在派單地點後\n"
     "更新資費\n完整內容 → 替換目前固定資費，新舊派單均改用最新內容\n"
@@ -2075,7 +2182,11 @@ DISPATCHER_HELP = (
 ROOT_HELP = (
     "👑 黑貓B.B.C｜最高管理員指令\n\n"
     "【派單操作】\n"
-    "派單 地點A\n地點B\n更新派單\n地點A\n地點B（完整取代最新派單）\n追加地點 地點C\n修改地點 2 新地點\n刪除地點 2\n取消（不公告）\n喊單列表\n回 @司機名稱 內容\n訂單列表\n清理全部\n狀態\n即時看板\n\n"
+    "派單 地點A\n地點B\n更新派單\n地點A\n地點B（完整取代最新派單）\n追加地點 地點C\n修改地點 2 新地點\n刪除地點 2\n取消（取消自動刷單，不公告）\n喊單列表\n回 @司機名稱 內容\n清理全部\n狀態\n即時看板\n\n"
+    "【訂單列表與整筆訂單管理】\n"
+    "訂單列表（查看目前所有訂單）\n"
+    "刪除訂單 編號 → 選取整筆獨立訂單，需再輸入「確認刪除訂單」\n"
+    "確認刪除訂單 → 確認刪除；取消刪除訂單 → 放棄刪除\n"
     "【固定資費管理】\n"
     "設定資費\n完整內容（首次設定）\n更新資費\n完整內容（替換內容）\n查看資費\n清除資費\n\n"
     "【人員管理】\n"
