@@ -3,6 +3,7 @@ import os
 import re
 import time
 import tempfile
+import shutil
 import uuid
 import urllib.parse
 import urllib.request
@@ -22,8 +23,8 @@ from linebot.v3.webhooks import (MessageEvent, TextMessageContent, GroupSource, 
                                  JoinEvent, MemberLeftEvent, LeaveEvent)
 
 # ============================================================
-# 黑貓B.B.C v3.9.0｜LINE Login 管理後台雙向同步版
-# 黑貓B.B.C 雙群組版｜v3.9.3 固定資費＋多筆訂單管理測試版
+# 黑貓B.B.C v3.10.1｜Auto Group Recovery＋State Backup 測試版
+# 黑貓B.B.C 雙群組版｜v3.10.1 Auto Group Recovery＋State Backup 測試版
 # 司機群組：司機喊單、接收派單／指定司機／取消通知
 # 派單員群組：管理員查看喊單、發布訂單、指定司機及管理訂單
 # 派單員指定司機／回覆／取消：先寫入待通知佇列，不使用 Push API。
@@ -33,6 +34,8 @@ from linebot.v3.webhooks import (MessageEvent, TextMessageContent, GroupSource, 
 CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 CHANNEL_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
+# Free 方案下先提供同一檔案系統內的備份；若未來使用 Persistent Disk，主檔與備份可一起放在掛載路徑。
+STATE_BACKUP_FILE = os.environ.get("STATE_BACKUP_FILE", STATE_FILE + ".bak")
 RESEND_INTERVAL = int(os.environ.get("RESEND_INTERVAL", "30"))
 
 app = Flask(__name__)
@@ -58,22 +61,43 @@ def default_state():
         "pending_root_transfer": None, "permission_revocations": [],
         "driver_group": None, "driver_groups": [], "dispatcher_group": None,
         "driver_group_records": [], "pending_driver_group_requests": [], "admin_audit_log": [], "member_directory": {}, "dispatcher_profiles": {},
+        "group_recovery_registry": {},
         "next_id": 1, "orders": {}, "drivers": {}, "fixed_fare_text": "",
         "pending_order_deletions": {},
         "dispatcher_replies": [], "pending_notifications": [], "last_passive_ts": 0.0, "seen_message_ids": []
     }
 
 
+def _read_state_file(path):
+    """只接受可解析且為 JSON object 的狀態檔。"""
+    with open(path, encoding="utf-8") as f:
+        value = json.load(f)
+    if not isinstance(value, dict):
+        raise ValueError("state file root must be a JSON object")
+    return value
+
+
 def load():
     data = default_state()
-    if os.path.exists(STATE_FILE):
+    primary_ok = False
+    try:
+        old = _read_state_file(STATE_FILE)
+        data.update(old)
+        primary_ok = True
+    except FileNotFoundError:
+        print("state primary missing; checking backup", flush=True)
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        print("state primary invalid; checking backup:", str(e), flush=True)
+
+    if not primary_ok:
         try:
-            with open(STATE_FILE, encoding="utf-8") as f:
-                old = json.load(f)
-            if isinstance(old, dict):
-                data.update(old)
-        except (OSError, json.JSONDecodeError) as e:
-            print("state load failed:", str(e), flush=True)
+            old = _read_state_file(STATE_BACKUP_FILE)
+            data.update(old)
+            print("state restored from backup", flush=True)
+        except FileNotFoundError:
+            print("state backup not found; starting with defaults", flush=True)
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            print("state backup invalid; defaults retained:", str(e), flush=True)
     # 舊版只有 group，舊群組視為司機群組，避免升級後原綁定失效。
     if not data.get("driver_group") and data.get("group"):
         data["driver_group"] = data.get("group")
@@ -99,6 +123,8 @@ def load():
         data["member_directory"] = {}
     if not isinstance(data.get("dispatcher_profiles"), dict):
         data["dispatcher_profiles"] = {}
+    if not isinstance(data.get("group_recovery_registry"), dict):
+        data["group_recovery_registry"] = {}
     if not isinstance(data.get("pending_order_deletions"), dict):
         data["pending_order_deletions"] = {}
     # 全域固定資費獨立保存；不混入訂單地點資料，升級舊 state 時預設為空。
@@ -226,17 +252,35 @@ if not S.get("dispatcher_group") and os.environ.get("DISPATCHER_GROUP_ID"):
     S["dispatcher_group"] = os.environ["DISPATCHER_GROUP_ID"]
 
 
-def save():
-    folder = os.path.dirname(os.path.abspath(STATE_FILE))
+def _atomic_write_json(path, payload, prefix):
+    folder = os.path.dirname(os.path.abspath(path))
     os.makedirs(folder, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix="carspeed_", suffix=".json", dir=folder)
+    fd, tmp = tempfile.mkstemp(prefix=prefix, suffix=".json", dir=folder)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(S, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, STATE_FILE)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
+
+
+def _backup_current_state_if_valid():
+    """更新單份最近有效備份；絕不以損壞的主檔覆蓋有效備份。"""
+    try:
+        current = _read_state_file(STATE_FILE)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    _atomic_write_json(STATE_BACKUP_FILE, current, "carspeed_backup_")
+    return True
+
+
+def save():
+    # 先保存上一份有效狀態，再原子替換主檔；避免半寫入破壞主檔及備份。
+    _backup_current_state_if_valid()
+    _atomic_write_json(STATE_FILE, S, "carspeed_state_")
 
 
 save()
@@ -1600,6 +1644,36 @@ def on_member_left(event):
         print("member-left handler error:", err_text(e), flush=True)
 
 
+def confirm_group_recovery_once(group_id):
+    """首次訊息只確認已授權群組；成功後持久化標記，往後直接沿用，不重複綁定。"""
+    if not group_id:
+        return False
+    registry = S.setdefault("group_recovery_registry", {})
+    if not isinstance(registry, dict):
+        registry = S["group_recovery_registry"] = {}
+    # 已確認群組：直接沿用，不再做恢復比對或重複寫入。
+    if group_id in registry and isinstance(registry[group_id], dict) and registry[group_id].get("confirmed") is True:
+        return True
+
+    # 僅能從既有正式授權來源確認，絕不因陌生群組發話而新增綁定。
+    if group_id == S.get("dispatcher_group"):
+        group_type = "dispatcher"
+    elif group_id in active_driver_groups():
+        group_type = "driver"
+    else:
+        return False
+
+    registry[group_id] = {
+        "group_type": group_type,
+        "confirmed": True,
+        "confirmed_at": now_tw(),
+        "source": "existing_authorized_binding",
+    }
+    save()
+    print(f"group recovery confirmed once: type={group_type}", flush=True)
+    return True
+
+
 @handler.add(MessageEvent, message=TextMessageContent)
 def on_message(event):
     try:
@@ -1609,6 +1683,8 @@ def on_message(event):
         if isinstance(src, GroupSource):
             if remember_message(getattr(event.message, "id", None)):
                 return
+            # 只對原本已授權群組做一次性恢復確認；陌生群組不會被自動綁定。
+            confirm_group_recovery_once(getattr(src, "group_id", None))
             if (not S.get("root_admin_id") and not S.get("bootstrap_initialized")
                     and src.group_id == S.get("bootstrap_group_id")):
                 handle_bootstrap_message(event, text, src)
