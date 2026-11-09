@@ -1101,7 +1101,7 @@ def callback():
 
 @app.get("/")
 def health():
-    return "黑貓B.B.C v3.9.0 dual-group bot is running"
+    return "黑貓B.B.C v3.9.4 mini dashboard test build is running"
 
 
 # ---------------- LIFF / 網頁即時派單看板 ----------------
@@ -1126,11 +1126,30 @@ button.active{background:#173e4a;color:white}.pill{font-size:11px;padding:6px 9p
 .card{margin:10px 0}.head{display:flex;justify-content:space-between;align-items:center;gap:8px}.muted{color:#78878c}
 .driver{font-weight:bold;margin:8px 0}.empty{background:white;border-radius:14px;padding:18px;text-align:center;color:#78878c;font-size:13px}
 .foot{text-align:center;color:#89969a;font-size:11px;padding:22px 0}
+
+/* v3.9.4：頁面內可拖曳迷你即時看板（不覆蓋 LINE 聊天視窗） */
+.mini-launch{margin-top:12px;background:#65dc82;color:#123b28;border:0;font-weight:800}
+.mini-board{position:fixed;z-index:9999;right:14px;bottom:18px;width:min(310px,calc(100vw - 28px));background:#17191d;color:#fff;border:1px solid #3b424a;border-radius:18px;padding:12px;box-shadow:0 10px 35px #0005;display:none;touch-action:pan-y}
+.mini-board.visible{display:block}
+.mini-head{display:flex;align-items:center;justify-content:space-between;gap:8px;cursor:grab;touch-action:none;user-select:none}
+.mini-head:active{cursor:grabbing}
+.mini-brand{font-weight:800;font-size:13px;letter-spacing:.3px}
+.mini-live{font-size:10px;color:#72e392}
+.mini-metrics{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+.mini-metric{background:#292d33;border-radius:12px;padding:10px}
+.mini-value{font-size:25px;font-weight:850;color:#72e392;line-height:1.2}
+.mini-label{font-size:11px;color:#c4cbd2;margin-top:4px}
+.mini-actions{display:flex;justify-content:space-between;align-items:center;margin-top:9px}
+.mini-actions button{background:#30363d;border-color:#4a535d;color:#fff;padding:6px 10px}
+.mini-hint{font-size:10px;color:#aab3bc}
+.mini-collapsed{position:fixed;z-index:10000;right:14px;bottom:18px;width:58px;height:58px;border-radius:18px;background:#172f39;color:white;border:2px solid #65dc82;box-shadow:0 8px 24px #0004;display:none;font-size:12px;font-weight:800}
+.mini-collapsed.visible{display:block}
+
 @media(max-width:400px){.app{padding:10px}.stat{padding:10px}.num{font-size:23px}}
 </style></head><body><main class="app">
 <header><div class="brand"><b>🚘</b> 黑貓B.B.C</div><h1>派單即時看板</h1>
 <div class="sub">司機喊單與回覆同步｜派單人員專用</div><span class="live" id="live">● 正在連線</span><button id="relogin" type="button" style="display:none;margin-top:10px" onclick="reloginLine()">重新登入 LINE</button>
-<div class="sub" id="updated" style="margin-top:9px">資料載入中…</div></header>
+<div class="sub" id="updated" style="margin-top:9px">資料載入中…</div><button class="mini-launch" id="miniLaunch" type="button">縮小為迷你看板</button></header>
 <section class="stats">
 <div class="stat"><div class="num" id="dispatchCount">—</div><small>進行中派單</small></div>
 <div class="stat"><div class="num" style="color:#159653" id="replyCount">—</div><small>司機已回覆</small></div>
@@ -1147,7 +1166,20 @@ button.active{background:#173e4a;color:white}.pill{font-size:11px;padding:6px 9p
 <article class="card"><div class="head"><b>司機群組管理</b><span class="muted">LINE／網頁共用資料</span></div><div id="groupList" class="info">載入中…</div></article>
 <article class="card"><b>最近管理操作紀錄</b><div id="adminAudit" class="info">載入中…</div></article></section>
 <div class="foot">黑貓B.B.C｜LINE 身分驗證｜頁面每 5 秒自動同步</div>
-</main><script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script><script>
+</main>
+<aside id="miniBoard" class="mini-board" aria-label="CAR SPEED 迷你即時看板">
+ <div class="mini-head" id="miniDragHandle">
+  <div><div class="mini-brand">🚘 CAR SPEED <span class="mini-live">● LIVE</span></div><div class="mini-hint">按住此處可拖曳</div></div>
+  <button id="miniExpand" type="button">展開</button>
+ </div>
+ <div class="mini-metrics">
+  <div class="mini-metric"><div class="mini-value" id="miniDispatchCount">—</div><div class="mini-label">有效訂單</div></div>
+  <div class="mini-metric"><div class="mini-value" id="miniReplyCount">—</div><div class="mini-label">司機已回覆</div></div>
+ </div>
+ <div class="mini-actions"><span class="mini-hint" id="miniUpdated">等待同步…</span><button id="miniHide" type="button">收起</button></div>
+</aside>
+<button id="miniCollapsed" class="mini-collapsed" type="button" aria-label="展開迷你看板">BBC<br>LIVE</button>
+<script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script><script>
 const LIFF_ID=__LIFF_ID_JSON__;let filter="all";let currentRole=null;
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 function cardReply(x){
@@ -1162,6 +1194,9 @@ function render(data){
  document.getElementById("dispatchCount").textContent=data.dispatches.length;
  document.getElementById("replyCount").textContent=data.shouts.filter(x=>x.status==="replied"||x.status==="completed").length;
  document.getElementById("pendingCount").textContent=data.shouts.filter(x=>x.status==="pending").length;
+ document.getElementById("miniDispatchCount").textContent=String(data.dispatches.length).padStart(2,"0");
+ document.getElementById("miniReplyCount").textContent=String(data.shouts.filter(x=>x.status==="replied"||x.status==="completed").length).padStart(2,"0");
+ document.getElementById("miniUpdated").textContent="更新 "+new Date().toLocaleTimeString("zh-TW",{hour12:false});
  const list=data.shouts.filter(x=>filter==="all"||(filter==="replied"&&x.status==="replied")||(filter==="pending"&&x.status==="pending")||(filter==="completed"&&x.status==="completed"));
  document.getElementById("replies").innerHTML=list.length?list.map(cardReply).join(""):'<div class="empty">目前沒有符合條件的紀錄</div>';
  document.getElementById("completedTools").style.display=filter==="completed"?"flex":"none";
@@ -1198,6 +1233,50 @@ async function reloginLine(){
  try{document.getElementById("relogin").style.display="none";if(!window.liff)throw new Error("LINE LIFF SDK 尚未載入");if(liff.isLoggedIn())liff.logout();liff.login({redirectUri:location.href})}
  catch(e){showDashboardError("重新登入失敗："+e.message,true)}
 }
+
+// 迷你看板只在目前網頁/LIFF 視窗內浮動；不會浮在 LINE 聊天畫面上方。
+const miniBoard=document.getElementById("miniBoard");
+const miniCollapsed=document.getElementById("miniCollapsed");
+document.getElementById("miniLaunch").addEventListener("click",()=>{
+ miniBoard.classList.add("visible");miniCollapsed.classList.remove("visible");
+});
+document.getElementById("miniExpand").addEventListener("click",()=>{
+ miniBoard.classList.remove("visible");window.scrollTo({top:0,behavior:"smooth"});
+});
+document.getElementById("miniHide").addEventListener("click",()=>{
+ miniBoard.classList.remove("visible");miniCollapsed.classList.add("visible");
+});
+miniCollapsed.addEventListener("click",()=>{
+ miniCollapsed.classList.remove("visible");miniBoard.classList.add("visible");
+});
+(()=>{
+ const handle=document.getElementById("miniDragHandle");
+ let dragging=false,startX=0,startY=0,left=0,top=0;
+ handle.addEventListener("pointerdown",e=>{
+  if(e.target.closest("button"))return;
+  const r=miniBoard.getBoundingClientRect();
+  dragging=true;startX=e.clientX;startY=e.clientY;left=r.left;top=r.top;
+  handle.setPointerCapture(e.pointerId);e.preventDefault();
+ });
+ handle.addEventListener("pointermove",e=>{
+  if(!dragging)return;
+  const maxLeft=Math.max(0,window.innerWidth-miniBoard.offsetWidth);
+  const maxTop=Math.max(0,window.innerHeight-miniBoard.offsetHeight);
+  const x=Math.min(maxLeft,Math.max(0,left+e.clientX-startX));
+  const y=Math.min(maxTop,Math.max(0,top+e.clientY-startY));
+  miniBoard.style.left=x+"px";miniBoard.style.top=y+"px";
+  miniBoard.style.right="auto";miniBoard.style.bottom="auto";
+ });
+ const stop=()=>{dragging=false};
+ handle.addEventListener("pointerup",stop);handle.addEventListener("pointercancel",stop);
+ window.addEventListener("resize",()=>{
+  if(!miniBoard.classList.contains("visible"))return;
+  const r=miniBoard.getBoundingClientRect();
+  miniBoard.style.left=Math.max(0,Math.min(r.left,window.innerWidth-miniBoard.offsetWidth))+"px";
+  miniBoard.style.top=Math.max(0,Math.min(r.top,window.innerHeight-miniBoard.offsetHeight))+"px";
+ });
+})();
+
 async function startLiff(){
  try{
   if(!LIFF_ID)throw new Error("LIFF_ID 尚未設定，請聯絡系統管理員");
