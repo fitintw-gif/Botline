@@ -1167,9 +1167,9 @@ button.active{background:#173e4a;color:white}.pill{font-size:11px;padding:6px 9p
 <article class="card"><b>最近管理操作紀錄</b><div id="adminAudit" class="info">載入中…</div></article></section>
 <div class="foot">黑貓B.B.C｜LINE 身分驗證｜頁面每 5 秒自動同步</div>
 </main>
-<aside id="miniBoard" class="mini-board" aria-label="CAR SPEED 迷你即時看板">
+<aside id="miniBoard" class="mini-board" aria-label="黑貓B.B.C 迷你即時看板">
  <div class="mini-head" id="miniDragHandle">
-  <div><div class="mini-brand">🚘 CAR SPEED <span class="mini-live">● LIVE</span></div><div class="mini-hint">長按面板可移動</div></div>
+  <div><div class="mini-brand">🚘 黑貓B.B.C <span class="mini-live">● LIVE</span></div><div class="mini-hint">長按面板可移動</div></div>
   <button id="miniExpand" type="button">展開</button>
  </div>
  <div class="mini-metrics">
