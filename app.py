@@ -265,6 +265,7 @@ def queue_driver_notification(text, driver_user_id=None, driver_name=None,
     """排入指定來源司機群組的通知；不呼叫 Push API。"""
     item = {
         "id": uuid.uuid4().hex,
+        "kind": "message",
         "text": str(text),
         "driver_user_id": driver_user_id,
         "driver_name": driver_name,
@@ -274,33 +275,51 @@ def queue_driver_notification(text, driver_user_id=None, driver_name=None,
         "created_at": now_tw(),
     }
     S.setdefault("pending_notifications", []).append(item)
-    # 防止狀態檔無限制增長；保留最近 500 筆待通知。
     S["pending_notifications"] = S["pending_notifications"][-500:]
     save()
     return item
 
 
+def queue_dispatch_refresh(order_id=None):
+    """每個核准司機群各保留一個更新標記；回覆時才讀取最新 state，不保存舊文字快照。"""
+    queue = S.setdefault("pending_notifications", [])
+    for group_id in get_driver_groups():
+        markers = [item for item in queue
+                   if item.get("kind") == "dispatch_refresh"
+                   and item.get("target_group_id") == group_id]
+        marker = markers[0] if markers else None
+        if len(markers) > 1:
+            duplicate_ids = {item.get("id") for item in markers[1:]}
+            queue[:] = [item for item in queue if item.get("id") not in duplicate_ids]
+        if marker:
+            marker["order_id"] = str(order_id) if order_id is not None else None
+            marker["created_at"] = now_tw()
+        else:
+            queue.append({
+                "id": uuid.uuid4().hex,
+                "kind": "dispatch_refresh",
+                "text": "",
+                "order_id": str(order_id) if order_id is not None else None,
+                "target_group_id": group_id,
+                "created_at": now_tw(),
+            })
+    S["pending_notifications"] = queue[-500:]
+    save()
+    return len(get_driver_groups())
+
+
 def driver_group_reply(event, text=None, allow_passive=True):
-    """以司機群組當前事件的 Reply Token，分開送出指定司機引用回覆及一般派單內容。"""
-    uid = event.source.user_id
+    """只用目前司機群組事件的 Reply Token；更新標記在送出當下讀取最新派單內容。"""
     current_group_id = getattr(event.source, "group_id", None)
     now = time.time()
     queue = S.setdefault("pending_notifications", [])
+    ready = [item for item in queue
+             if not item.get("target_group_id")
+             or item.get("target_group_id") == current_group_id]
 
-    # 只處理「這個司機群組」的通知；舊版沒有 target_group_id 的佇列仍相容。
-    # 例如 A 群的喊單回覆，絕不會被 B 群的下一則訊息取走。
-    ready = [
-        item for item in queue
-        if not item.get("target_group_id")
-        or item.get("target_group_id") == current_group_id
-    ]
-
-    orders = active_orders()
-    # 首次推播狀態必須「逐群組」記錄，不能由 A 群的成功回覆替 B 群標記完成。
+    orders = active_dispatch_orders()
     first_due = []
     for oid, order in orders:
-        if order.get("kind") != "dispatch":
-            continue
         if "first_reply_after" not in order:
             order["first_reply_after"] = now + 5
         sent_groups = order.setdefault("first_reply_sent_groups", [])
@@ -308,38 +327,42 @@ def driver_group_reply(event, text=None, allow_passive=True):
                 and now >= float(order.get("first_reply_after", now + 5))):
             first_due.append((oid, order))
 
-    # 後續 30 秒計時同樣逐群組保存，A 群更新不會重設 B 群的計時。
     last_by_group = S.setdefault("last_passive_ts_by_group", {})
     last_passive = float(last_by_group.get(current_group_id, 0) or 0)
     waiting_first = any(
-        order.get("kind") == "dispatch"
-        and current_group_id not in order.get("first_reply_sent_groups", [])
+        current_group_id not in order.get("first_reply_sent_groups", [])
         for _, order in orders
     )
-    regular_refresh_due = (
-        not waiting_first and now - last_passive >= RESEND_INTERVAL
-    )
-    passive_due = bool(
-        allow_passive and orders and (first_due or regular_refresh_due)
-    )
+    regular_refresh_due = not waiting_first and now - last_passive >= RESEND_INTERVAL
+    passive_due = bool(allow_passive and orders and (first_due or regular_refresh_due))
 
-    messages = []
-    sent_notification_ids = []
+    manual_board_included = bool(text and "📦 目前可接派單" in str(text))
+    notification_pairs = []
+    stale_notification_ids = []
 
-    # 派單員對特定司機的回覆：獨立訊息、引用該司機原始喊單、原生標註司機。
-    # 不把自動刷單／派單內容併入這則引用訊息。
     for item in ready:
+        item_id = item.get("id")
+        if item.get("kind") == "dispatch_refresh":
+            # 手動查詢訂單列表本身已包含最新完整內容，不再重複貼一次。
+            if manual_board_included:
+                notification_pairs.append((item_id, None))
+                continue
+            board = format_active_dispatch_board(orders)
+            if not board:
+                stale_notification_ids.append(item_id)
+                continue
+            body = f"📣 派單內容已更新\n{board}\n\n以上為最新完整派單內容。"
+            if len(body) > 4800:
+                body = body[:4780] + "\n…（內容過長，已截斷）"
+            notification_pairs.append((item_id, TextMessage(text=body)))
+            continue
+
         driver_user_id = item.get("driver_user_id")
         substitutions = None
         body = str(item.get("text", "📣 派單員有新回覆。"))
         if driver_user_id:
-            driver_name = next(
-                (
-                    name for name, saved_uid in S.get("drivers", {}).items()
-                    if saved_uid == driver_user_id
-                ),
-                None,
-            )
+            driver_name = next((name for name, saved_uid in S.get("drivers", {}).items()
+                                if saved_uid == driver_user_id), None)
             if driver_name:
                 key = "driver0"
                 body = f"{{{key}}}\n{body}"
@@ -348,74 +371,94 @@ def driver_group_reply(event, text=None, allow_passive=True):
                         mentionee=UserMentionTarget(user_id=driver_user_id)
                     )
                 }
-
         quote_token = item.get("quote_token")
         if substitutions or quote_token:
-            messages.append(TextMessageV2(
-                text=body,
-                substitution=substitutions,
-                quote_token=quote_token,
-            ))
+            message = TextMessageV2(
+                text=body, substitution=substitutions, quote_token=quote_token
+            )
         else:
-            messages.append(TextMessage(text=body))
-        sent_notification_ids.append(item.get("id"))
+            message = TextMessage(text=body)
+        notification_pairs.append((item_id, message))
 
-    # 一般派單內容／自動刷單：獨立的非引用訊息，不和「回 @司機」共用同一引文。
-    if passive_due:
-        body = "\n──────\n".join(
-            str(order.get("content", "")) for _, order in orders
-        )
-        heading = (
-            "🔄 自動刷單｜首次更新"
-            if first_due else "🔄 自動刷單｜訂單更新"
-        )
-        refresh_text = f"{heading}\n{body}\n\n以上為目前有效訂單。"
-        messages.append(TextMessage(text=refresh_text))
+    # 手動訂單列表已包含最新完整內容；即使佇列較長，也一併消化本群派單更新標記。
+    preconsumed_refresh_ids = [
+        item.get("id") for item in ready
+        if manual_board_included and item.get("kind") == "dispatch_refresh" and item.get("id")
+    ]
+    if preconsumed_refresh_ids:
+        consumed = set(preconsumed_refresh_ids)
+        notification_pairs = [pair for pair in notification_pairs if pair[0] not in consumed]
 
+    messages = []
     if text:
-        messages.insert(0, TextMessage(text=str(text)))
+        messages.append(TextMessage(text=str(text)[:4900]))
+
+    # LINE Reply API 一次最多 5 則；優先送出群組待通知，再送自動刷新內容。
+    available_slots = max(0, 5 - len(messages))
+    selected_pairs = notification_pairs[:available_slots]
+    sent_notification_ids = list(preconsumed_refresh_ids) + [
+        item_id for item_id, _ in selected_pairs if item_id
+    ]
+    for _, message in selected_pairs:
+        if message is not None:
+            messages.append(message)
+
+    selected_dispatch_refresh = any(
+        item.get("kind") == "dispatch_refresh" and item.get("id") in sent_notification_ids
+        for item in ready
+    )
+    refresh_board_sent = bool(selected_dispatch_refresh or manual_board_included)
+
+    # 若更新標記已送出，該訊息本身就是完整最新看板，避免同一個 Reply 重複貼兩次。
+    passive_message_sent = False
+    if passive_due and not refresh_board_sent and len(messages) < 5:
+        board = format_active_dispatch_board(orders)
+        if board:
+            body = f"🔄 自動刷單｜{'首次更新' if first_due else '訂單更新'}\n{board}\n\n以上為目前有效派單。"
+            if len(body) > 4800:
+                body = body[:4780] + "\n…（內容過長，已截斷）"
+            messages.append(TextMessage(text=body))
+            passive_message_sent = True
+            refresh_board_sent = True
 
     if not messages:
+        if stale_notification_ids:
+            stale = set(stale_notification_ids)
+            S["pending_notifications"] = [x for x in queue if x.get("id") not in stale]
+            save()
         return
-
-    # LINE Reply API 一次最多 5 則訊息；若通知多於 5 則，先送出前 5 則，其餘留待下次事件。
-    messages = messages[:5]
-    sent_count = min(len(sent_notification_ids), len(messages) - (1 if text else 0))
-    sent_ids = set(sent_notification_ids[:max(0, sent_count)])
 
     try:
         with ApiClient(config) as client:
             MessagingApi(client).reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=messages,
-                )
+                ReplyMessageRequest(reply_token=event.reply_token, messages=messages)
             )
     except Exception as exc:
         STATS["last_err"] = f"{now_tw()} {err_text(exc)}"
         print("driver group reply failed:", err_text(exc), flush=True)
         return
 
-    if sent_ids:
+    consumed_ids = set(sent_notification_ids) | set(stale_notification_ids)
+    if consumed_ids:
         S["pending_notifications"] = [
-            item for item in queue if item.get("id") not in sent_ids
+            item for item in queue if item.get("id") not in consumed_ids
         ]
 
-    if passive_due and any(isinstance(msg, TextMessage) and "自動刷單" in (msg.text or "")
-                           for msg in messages):
-        for _, order in first_due:
+    if refresh_board_sent:
+        sent_at = now
+        # 完整看板已送出，這個群組已實際看過目前所有進行中派單。
+        for _, order in orders:
             sent_groups = order.setdefault("first_reply_sent_groups", [])
             if current_group_id not in sent_groups:
                 sent_groups.append(current_group_id)
-            order.setdefault("first_reply_sent_at_by_group", {})[current_group_id] = now
-        last_by_group[current_group_id] = now
-        # 舊欄位僅保留供舊版狀態檢視相容，不再用來判斷其他群組是否已收到。
-        S["last_passive_ts"] = now
-        STATS["passive"] += 1
+            order.setdefault("first_reply_sent_at_by_group", {})[current_group_id] = sent_at
+        last_by_group[current_group_id] = sent_at
+        S["last_passive_ts"] = sent_at  # 舊欄位相容
+        if passive_message_sent or selected_dispatch_refresh:
+            STATS["passive"] += 1
 
-    if sent_ids or passive_due:
+    if consumed_ids or refresh_board_sent:
         save()
-
 
 def is_root_admin(user_id):
     return bool(user_id and user_id == S.get("root_admin_id"))
@@ -479,6 +522,85 @@ def one_line(content, n=100):
 
 def active_orders():
     return [(oid, o) for oid, o in S["orders"].items() if o.get("status", "active") == "active"]
+
+
+# ---------------- 智能派單 2.0：多地點解析與編輯 ----------------
+def parse_dispatch_locations(raw_text):
+    """將多行／已編號的地點原文整理成有序地點清單，不重複保留使用者輸入的序號。"""
+    text = str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return []
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    if len(lines) == 1:
+        line = lines[0]
+        # 先處理已編號的單行清單，避免把「1、A、2、B」拆成序號與地點兩欄。
+        if re.match(r"^\s*(?:\d+|[一二三四五六七八九十]+)\s*[.．、)）]", line):
+            split_lines = re.split(r"(?=(?:\d+|[一二三四五六七八九十]+)\s*[.．、)）]\s*)", line)
+            lines = [part for part in split_lines if part.strip()]
+        elif re.search(r"[；;|｜、]", line):
+            lines = re.split(r"[；;|｜、]+", line)
+        else:
+            # 兼容同一行輸入「地點A 2. 地點B」。
+            split_lines = re.split(r"(?=\s+(?:\d+|[一二三四五六七八九十]+)\s*[.．、)）]\s*)", line)
+            if len(split_lines) > 1:
+                lines = split_lines
+
+    locations = []
+    prefix = re.compile(r"^\s*(?:(?:\d+|[一二三四五六七八九十]+)\s*[.．、)）]|[-*•])\s*")
+    for line in lines:
+        value = prefix.sub("", str(line).strip()).strip(" \t　•·、，,；;|｜")
+        if value:
+            locations.append(value)
+    return locations
+
+
+def render_dispatch_locations(locations):
+    return "\n".join(f"{index}. {location}" for index, location in enumerate(locations, 1))
+
+
+def dispatch_order_locations(order):
+    saved = order.get("locations")
+    if isinstance(saved, list) and saved:
+        locations = [str(x).strip() for x in saved if str(x).strip()]
+        if locations:
+            return locations
+    locations = parse_dispatch_locations(order.get("content", ""))
+    return locations or ([str(order.get("content", "")).strip()] if str(order.get("content", "")).strip() else [])
+
+
+def format_dispatch_order(order):
+    locations = dispatch_order_locations(order)
+    return render_dispatch_locations(locations) if locations else "（尚未設定地點）"
+
+
+def active_dispatch_orders():
+    return [(oid, order) for oid, order in active_orders()
+            if order.get("kind") == "dispatch"]
+
+
+def format_active_dispatch_board(orders=None):
+    dispatches = orders if orders is not None else active_dispatch_orders()
+    blocks = []
+    for _, order in dispatches:
+        blocks.append("📍 派單內容\n" + format_dispatch_order(order))
+    return "📦 目前可接派單\n────────────\n" + "\n\n────────────\n\n".join(blocks) if blocks else ""
+
+
+def latest_active_dispatch():
+    """追加／修改／刪除作用於最新建立且仍進行中的派單；內部 ID 僅供程式定位。"""
+    dispatches = active_dispatch_orders()
+    return dispatches[-1] if dispatches else (None, None)
+
+
+def persist_dispatch_locations(order_id, order, locations, actor_user_id=None):
+    order["locations"] = list(locations)
+    order["content"] = render_dispatch_locations(locations)
+    order["updated_at"] = now_tw()
+    order["updated_ts"] = time.time()
+    order["location_revision"] = int(order.get("location_revision", 0) or 0) + 1
+    order["last_modified_by"] = actor_user_id
+    save()
+    queue_dispatch_refresh(order_id)
 
 
 def pending_shouts():
@@ -728,25 +850,24 @@ def dispatcher_shout_list():
 
 
 def active_order_list():
-    rows = ["📦 目前可接訂單", "────────────"]
-    for oid, o in active_orders():
-        rows.append(f"#{oid}｜{one_line(o.get('content',''), 180)}")
-    if len(rows) == 2:
-        return "目前沒有進行中的訂單。"
-    rows.append("────────────\n接單請依派單員公告方式聯繫，並回報訂單編號。")
-    return "\n".join(rows)
+    board = format_active_dispatch_board()
+    return board if board else "目前沒有進行中的派單。"
 
 
 def cancel_all_orders():
     count = 0
-    for o in S["orders"].values():
-        if o.get("status", "active") == "active":
-            o["status"] = "cancelled"
-            o["updated_at"] = now_tw()
+    for order in S["orders"].values():
+        if order.get("status", "active") == "active":
+            order["status"] = "cancelled"
+            order["updated_at"] = now_tw()
             count += 1
+    # 取消不公告：同時移除尚未送出的派單更新標記，避免取消後又貼出舊內容。
+    S["pending_notifications"] = [
+        item for item in S.get("pending_notifications", [])
+        if item.get("kind") != "dispatch_refresh"
+    ]
     save()
     return f"✅ 已取消 {count} 筆進行中訂單。" if count else "目前沒有進行中的訂單。"
-
 
 def get_driver_name(group_id, user_id):
     # 已記錄的 LINE userId 優先，避免更名後無法找到司機。
@@ -923,7 +1044,7 @@ function render(data){
  document.getElementById("replies").innerHTML=list.length?list.map(cardReply).join(""):'<div class="empty">目前沒有符合條件的紀錄</div>';
  document.getElementById("completedTools").style.display=filter==="completed"?"flex":"none";
  document.getElementById("clearCompleted").disabled=!data.shouts.some(x=>x.status==="completed");
- document.getElementById("dispatches").innerHTML=data.dispatches.length?data.dispatches.map(x=>`<article class="card"><div class="head"><b>派單 ${esc(x.id)}</b><span class="pill wait">進行中</span></div><div class="info">${esc(x.content).replace(/\n/g,"<br>")}<div class="muted" style="margin-top:7px">${esc(x.created_at||"")}</div></div></article>`).join(""):'<div class="empty">目前沒有進行中的派單</div>';
+ document.getElementById("dispatches").innerHTML=data.dispatches.length?data.dispatches.map(x=>`<article class="card"><div class="head"><b>派單內容</b><span class="pill wait">進行中</span></div><div class="info">${esc(x.content).replace(/\n/g,"<br>")}<div class="muted" style="margin-top:7px">${esc(x.created_at||"")}</div></div></article>`).join(""):'<div class="empty">目前沒有進行中的派單</div>';
  document.getElementById("updated").textContent="最後同步："+new Date().toLocaleTimeString("zh-TW",{hour12:false});
  document.getElementById("live").textContent="● 即時同步中";
 }
@@ -1174,9 +1295,9 @@ def dashboard_data():
         kind = order.get("kind")
         if kind == "dispatch" and order.get("status", "active") == "active":
             dispatches.append({
-                "id": str(oid),
-                "content": str(order.get("content", "")),
+                "content": format_dispatch_order(order),
                 "created_at": order.get("created_at", ""),
+                "_sort_ts": _order_timestamp(order, "created_ts"),
             })
         elif kind == "shout" and order.get("status") in ("pending", "replied", "completed"):
             raw = str(order.get("content", ""))
@@ -1212,7 +1333,9 @@ def dashboard_data():
                          ("replied_at_ts" if x["status"] == "replied" else "created_ts"),
                          "updated_at" if x["status"] != "pending" else "created_at")
     ), reverse=True)
-    dispatches.sort(key=lambda x: S.get("orders", {}).get(x["id"], {}).get("created_ts", 0), reverse=True)
+    dispatches.sort(key=lambda x: x.get("_sort_ts", 0), reverse=True)
+    for item in dispatches:
+        item.pop("_sort_ts", None)
     return jsonify({
         "dispatches": dispatches[:100],
         "shouts": shouts[:200],
@@ -1676,17 +1799,81 @@ def on_dispatcher_group(event, text, src):
         result = cancel_all_orders()
         return reply(tok, result)
 
+    # 追加地點／追加訂單：更新最新一筆進行中的派單，不建立新內部訂單。
+    append_match = re.match(r"^(追加地點|追加訂單|追加)\s+(.+)$", cmd, re.S)
+    if append_match:
+        payload = append_match.group(2).strip()
+        additions = parse_dispatch_locations(payload)
+        if not additions:
+            return reply(tok, "請提供要追加的地點。格式：追加地點 地點A\n地點B")
+        oid, order = latest_active_dispatch()
+        if not order:
+            return reply(tok, "目前沒有進行中的派單，請先輸入「派單 地點內容」。")
+        locations = dispatch_order_locations(order) + additions
+        persist_dispatch_locations(oid, order, locations, uid)
+        return reply(tok, "✅ 已追加地點，原派單已更新（未建立新派單）。\n" + format_dispatch_order(order)
+                    + "\n\n司機群組下一次有新訊息時，會以 Reply 顯示最新完整地點清單。")
+    if cmd in ("追加", "追加地點", "追加訂單"):
+        return reply(tok, "格式：追加地點 地點A\n地點B\n（會追加到最新一筆進行中的派單，不會建立新派單）")
+
+    # 修改指定序號的地點；新地點必須是單一項目。
+    edit_match = re.match(r"^修改地點\s+(\d+)\s+(.+)$", cmd, re.S)
+    if edit_match:
+        index = int(edit_match.group(1))
+        replacement = parse_dispatch_locations(edit_match.group(2).strip())
+        oid, order = latest_active_dispatch()
+        if not order:
+            return reply(tok, "目前沒有進行中的派單。")
+        locations = dispatch_order_locations(order)
+        if index < 1 or index > len(locations):
+            return reply(tok, f"找不到第 {index} 個地點；目前共有 {len(locations)} 個地點。")
+        if len(replacement) != 1:
+            return reply(tok, "修改地點一次只能輸入一個地點。格式：修改地點 2 新地點內容")
+        locations[index - 1] = replacement[0]
+        persist_dispatch_locations(oid, order, locations, uid)
+        return reply(tok, "✅ 地點已修改，並已重新整理完整清單。\n" + format_dispatch_order(order)
+                    + "\n\n司機群組下一次有新訊息時，會以 Reply 顯示最新完整地點清單。")
+    if cmd.startswith("修改地點"):
+        return reply(tok, "格式：修改地點 2 新地點內容")
+
+    # 刪除指定地點後，剩餘地點會自動重新編號。
+    delete_match = re.match(r"^刪除地點\s+(\d+)\s*$", cmd)
+    if delete_match:
+        index = int(delete_match.group(1))
+        oid, order = latest_active_dispatch()
+        if not order:
+            return reply(tok, "目前沒有進行中的派單。")
+        locations = dispatch_order_locations(order)
+        if index < 1 or index > len(locations):
+            return reply(tok, f"找不到第 {index} 個地點；目前共有 {len(locations)} 個地點。")
+        removed = locations.pop(index - 1)
+        if not locations:
+            return reply(tok, "刪除後已沒有任何地點；若要結束派單，請使用「取消」。本次刪除未套用。")
+        persist_dispatch_locations(oid, order, locations, uid)
+        return reply(tok, f"✅ 已刪除地點：{removed}\n剩餘地點已自動重新編號。\n" + format_dispatch_order(order)
+                    + "\n\n司機群組下一次有新訊息時，會以 Reply 顯示最新完整地點清單。")
+    if cmd.startswith("刪除地點"):
+        return reply(tok, "格式：刪除地點 2")
+
     m = re.match(r"^派單\s+(.+)$", cmd, re.S)
     if m:
-        content = m.group(1).strip()
+        raw_content = m.group(1).strip()
+        locations = parse_dispatch_locations(raw_content)
+        if not locations:
+            return reply(tok, "請輸入至少一個派單地點。格式：派單 地點A\n地點B")
         oid = next_id()
         created_ts = time.time()
-        S["orders"][oid] = {"kind": "dispatch", "status": "active", "content": content,
-                            "created_at": now_tw(), "created_ts": created_ts,
-                            "first_reply_after": created_ts + 5, "first_reply_sent": False,
-                            "created_by": uid}
+        content = render_dispatch_locations(locations)
+        S["orders"][oid] = {
+            "kind": "dispatch", "status": "active", "internal_id": str(oid),
+            "content": content, "raw_content": raw_content, "locations": locations,
+            "location_revision": 1, "created_at": now_tw(), "created_ts": created_ts,
+            "first_reply_after": created_ts + 5, "first_reply_sent": False,
+            "first_reply_sent_groups": [], "created_by": uid,
+        }
         save()
-        return reply(tok, f"✅ 訂單已建立 #{oid}\n{content}\n\n自動刷單：建立 5 秒後，司機群組有新訊息事件時首次 Reply 更新；之後每 {RESEND_INTERVAL} 秒，有新訊息事件時再 Reply 更新。")
+        return reply(tok, "✅ 已建立派單\n" + format_dispatch_order(S["orders"][oid])
+                    + f"\n\n自動刷新：建立 5 秒後，司機群組有新訊息事件時首次 Reply；之後每 {RESEND_INTERVAL} 秒，有該群新訊息事件時再 Reply。")
 
     if cmd.startswith("回 "):
         payload = cmd[2:].strip()
@@ -1785,7 +1972,10 @@ BASIC_HELP = (
 DISPATCHER_HELP = (
     "🧑‍💼 黑貓B.B.C｜一般派單員指令\n\n"
     "【派單操作】\n"
-    "派單 訂單內容 → 新增可接訂單\n"
+    "派單 地點A\n地點B → 新增派單（自動編號地點）\n"
+    "追加地點 地點C → 追加到最新進行中派單（不建立新派單）\n"
+    "修改地點 2 新地點 → 修改第 2 個地點\n"
+    "刪除地點 2 → 刪除第 2 個地點並重新編號\n"
     "取消 → 結束全部進行中派單（不公告）\n"
     "喊單列表 → 查看司機待處理喊單\n"
     "回 @司機名稱 內容 → 回覆該司機最新喊單\n\n"
@@ -1799,7 +1989,7 @@ DISPATCHER_HELP = (
 ROOT_HELP = (
     "👑 黑貓B.B.C｜最高管理員指令\n\n"
     "【派單操作】\n"
-    "派單 訂單內容\n取消\n喊單列表\n回 @司機名稱 內容\n訂單列表\n清理全部\n狀態\n即時看板\n\n"
+    "派單 地點A\n地點B\n追加地點 地點C\n修改地點 2 新地點\n刪除地點 2\n取消（不公告）\n喊單列表\n回 @司機名稱 內容\n訂單列表\n清理全部\n狀態\n即時看板\n\n"
     "【人員管理】\n"
     "指派派單員 @人員\n撤銷派單 @人員\n派單員列表\n派單權限紀錄\n\n"
     "【司機群組管理】\n"
