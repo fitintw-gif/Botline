@@ -645,9 +645,8 @@ def format_dispatch_order(order):
     """顯示地點後附加目前全域資費原文；資費不進入地點陣列、不參與編號。"""
     locations = dispatch_order_locations(order)
     body = render_dispatch_locations(locations) if locations else "（尚未設定地點）"
+    # 直接附加獨立設定的資費原文，不額外加上「資費」標題。
     fare_text = str(S.get("fixed_fare_text", "") or "").strip()
-    if fare_text and not re.match(r"^資費\s*[:：]", fare_text):
-        fare_text = "資費：" + fare_text
     return body + ("\n\n" + fare_text if fare_text else "")
 
 
