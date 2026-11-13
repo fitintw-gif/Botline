@@ -1923,6 +1923,32 @@ def on_group(event, text, src):
         save()
         return reply(tok, "✅ 已由最高管理員綁定為【派單群組】。只有最高管理員及已指派派單員可在此操作。")
 
+    # 派單群組解除採二次確認，避免誤觸造成管理入口失效。
+    if text == "解除派單群組":
+        if not is_root_admin(uid):
+            return reply(tok, "⛔ 只有最高管理員可以解除派單群組。")
+        if gid != S.get("dispatcher_group"):
+            return reply(tok, "⛔ 此群組不是目前已綁定的派單群組，無法在此解除。")
+        S["pending_dispatcher_group_unbind"] = {"group_id": gid, "requested_by": uid, "requested_at": now_tw()}
+        save()
+        return reply(tok, "⚠️ 即將解除目前派單群組。\n解除後，本群組將失去派單管理功能；司機群組綁定及司機派單不受影響。\n如確定解除，請由提出申請的最高管理員在本群組輸入：確認解除派單群組\n如不解除，無須操作。")
+
+    if text == "確認解除派單群組":
+        if not is_root_admin(uid):
+            return reply(tok, "⛔ 只有最高管理員可以確認解除派單群組。")
+        pending = S.get("pending_dispatcher_group_unbind") or {}
+        if pending.get("group_id") != gid or pending.get("requested_by") != uid:
+            return reply(tok, "目前沒有由你在本群組提出的解除申請，請先輸入「解除派單群組」。")
+        if S.get("dispatcher_group") != gid:
+            S.pop("pending_dispatcher_group_unbind", None)
+            save()
+            return reply(tok, "目前派單群組資料已變更，解除申請已取消。")
+        S.pop("dispatcher_group", None)
+        S.pop("pending_dispatcher_group_unbind", None)
+        audit_admin("unbind_dispatcher_group", "group", gid, detail="最高管理員二次確認解除派單群組", actor_user_id=uid, context_group_id=gid)
+        save()
+        return reply(tok, "✅ 已解除派單群組綁定。\n本群組不再具有派單管理權限；司機群組及其綁定不受影響。\n如需重新設定，請將機器人加入新群組，再由最高管理員輸入「綁定派單群組」。")
+
     # 未核准群組可提出申請，但不能喊單或進入派單流程。
     if text in ("申請司機群組", "申請群組"):
         return request_driver_group(event, src)
@@ -2420,7 +2446,9 @@ ROOT_HELP = (
     "重新綁定狀態 → 查看恢復模式是否開啟\n"
     "結束重新綁定 → 關閉恢復模式；不影響正常新群組加入申請及已核准群組\n\n"
     "【派單群組】\n"
-    "綁定派單群組\n\n"
+    "綁定派單群組 → 將目前群組設定為派單群組\n"
+    "解除派單群組 → 提出解除目前派單群組申請\n"
+    "確認解除派單群組 → 由提出申請的最高管理員二次確認；解除後需重新綁定才能使用派單管理\n\n"
     "【最高管理員】\n"
     "轉讓最高管理員 @人員\n接受最高管理員（新任人員）\n確認轉讓最高管理員（現任最高管理員）\n"
     "Help → 顯示最高管理員完整指令"
