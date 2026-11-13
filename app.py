@@ -578,36 +578,57 @@ def active_orders():
 
 # ---------------- 智能派單 2.0：多地點解析與編輯 ----------------
 def parse_dispatch_locations(raw_text):
-    """將多行／已編號的地點原文整理成有序地點清單，不重複保留使用者輸入的序號。"""
+    """解析多地點；括弧內文字作為前一個上車地點的備註，不另計地點。"""
     text = str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     if not text:
         return []
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     if len(lines) == 1:
         line = lines[0]
-        # 先處理已編號的單行清單，避免把「1、A、2、B」拆成序號與地點兩欄。
         if re.match(r"^\s*(?:\d+|[一二三四五六七八九十]+)\s*[.．、)）]", line):
             split_lines = re.split(r"(?=(?:\d+|[一二三四五六七八九十]+)\s*[.．、)）]\s*)", line)
             lines = [part for part in split_lines if part.strip()]
         elif re.search(r"[；;|｜、]", line):
             lines = re.split(r"[；;|｜、]+", line)
         else:
-            # 兼容同一行輸入「地點A 2. 地點B」。
             split_lines = re.split(r"(?=\s+(?:\d+|[一二三四五六七八九十]+)\s*[.．、)）]\s*)", line)
             if len(split_lines) > 1:
                 lines = split_lines
 
     locations = []
     prefix = re.compile(r"^\s*(?:(?:\d+|[一二三四五六七八九十]+)\s*[.．、)）]|[-*•])\s*")
+    note_pattern = re.compile(r"（[^（）]*）|\([^()]*\)")
     for line in lines:
         value = prefix.sub("", str(line).strip()).strip(" \t　•·、，,；;|｜")
-        if value:
-            locations.append(value)
+        if not value:
+            continue
+        notes = note_pattern.findall(value)
+        address = note_pattern.sub("", value).strip(" \t　")
+        if not address and notes:
+            if locations:
+                locations[-1] += "\n" + "\n".join(notes)
+            continue
+        if address:
+            if notes:
+                address += "\n" + "\n".join(notes)
+            locations.append(address)
     return locations
 
 
 def render_dispatch_locations(locations):
-    return "\n".join(f"{index}. {location}" for index, location in enumerate(locations, 1))
+    """地點維持編號；附屬備註縮排顯示在該地點下一行。"""
+    blocks = []
+    for index, location in enumerate(locations, 1):
+        parts = str(location).splitlines()
+        address = parts[0].strip() if parts else ""
+        notes = [line.strip() for line in parts[1:] if line.strip()]
+        if not address:
+            continue
+        block = f"{index}. {address}"
+        if notes:
+            block += "\n" + "\n".join(f"   {note}" for note in notes)
+        blocks.append(block)
+    return "\n".join(blocks)
 
 
 def dispatch_order_locations(order):
@@ -625,6 +646,8 @@ def format_dispatch_order(order):
     locations = dispatch_order_locations(order)
     body = render_dispatch_locations(locations) if locations else "（尚未設定地點）"
     fare_text = str(S.get("fixed_fare_text", "") or "").strip()
+    if fare_text and not re.match(r"^資費\s*[:：]", fare_text):
+        fare_text = "資費：" + fare_text
     return body + ("\n\n" + fare_text if fare_text else "")
 
 
@@ -2255,6 +2278,11 @@ def on_dispatcher_group(event, text, src):
             return reply(tok, f"找不到第 {index} 個地點；目前共有 {len(locations)} 個地點。")
         if len(replacement) != 1:
             return reply(tok, "修改地點一次只能輸入一個地點。格式：修改地點 2 新地點內容")
+        # 修改地址時保留原本備註；若新輸入也包含括弧備註，則以新備註取代。
+        old_parts = str(locations[index - 1]).splitlines()
+        new_parts = str(replacement[0]).splitlines()
+        if len(new_parts) == 1 and len(old_parts) > 1:
+            replacement[0] = new_parts[0] + "\\n" + "\\n".join(old_parts[1:])
         locations[index - 1] = replacement[0]
         persist_dispatch_locations(oid, order, locations, uid)
         return reply(tok, "✅ 地點已修改，並已重新整理完整清單。\n" + format_dispatch_order(order)
